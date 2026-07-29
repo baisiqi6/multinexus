@@ -1,0 +1,56 @@
+# Environment & secrets
+.env
+agents.toml
+agents.toml.bak
+
+# Runtime data
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+# Special-named sqlite db files (colons need leading-slash precise match)
+/:memory:
+/:memory:-shm
+/:memory:-wal
+
+# Wiki private tier
+wiki/private/
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Claude Code + Codex session artifacts
+.tt/
+.discuss/
+# Repository-local agent runtime artifacts
+/sessions/
+/.claude/worktrees/
+/.planning/
+
+# Qoder project knowledge base (local, not for commit)
+.qoder/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PM2
+.pm2/

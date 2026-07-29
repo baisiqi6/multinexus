@@ -1,0 +1,22 @@
+{
+  "assigned_agent": "mac-omp",
+  "branch": "agents/mac-omp/p9-1-job-scoped-execution-context",
+  "context_id": "sha256:1772ee8f6450002f86f1579e150f77d14419696903283b0cdecec30fde3a053b",
+  "contract_version": 1,
+  "harness_root": "/home/example/multinexus/docs/project-harness",
+  "host_id": "macbook-local",
+  "job_id": "request:p9-1-fixture",
+  "legacy_scope_ids": [
+    "legacy:channel:1"
+  ],
+  "session_scope_id": "task:discord-nexus:p9-1-task",
+  "task_id": "p9-1-task",
+  "workspace_id": "discord-nexus",
+  "workspace_path": "/home/example/multinexus",
+  "worktree_path": "/home/example/multinexus",
+  "log_handle": {
+    "job_id": "request:p9-1-fixture",
+    "kind": "coordinate_job",
+    "logs_path": null
+  }
+}

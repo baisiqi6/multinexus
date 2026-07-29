@@ -1,0 +1,52 @@
+# Secret-free Coordinate authority example.
+#
+# Copy to config/agent-registry.toml, replace only public routing identities,
+# keep host paths/tokens/channels in agents.toml, and increment registry versions
+# whenever canonical fields change. All Discord IDs below are synthetic.
+
+[registry]
+id = "multinexus.example"
+version = 1
+
+[[executor_definitions]]
+id = "claude-code"
+provider = "anthropic-claude"
+adapter = "claude"
+capabilities = ["coding", "review"]
+
+[[executor_definitions]]
+id = "codex-code"
+provider = "openai-codex"
+adapter = "codex"
+capabilities = ["coding", "review"]
+
+[[agents]]
+id = "host-claude"
+display_name = "Host Claude"
+discord_user_id = "100000000000000001"
+executor_definition_id = "claude-code"
+runner_profile_id = "host-claude"
+
+[[agents]]
+id = "host-codex"
+display_name = "Host Codex"
+discord_user_id = "100000000000000002"
+executor_definition_id = "codex-code"
+runner_profile_id = "host-codex"
+
+[[external_agents]]
+id = "external-hermes"
+display_name = "Hermes"
+discord_user_id = "100000000000000003"
+
+[capacity_registry]
+id = "multinexus.example.capacity"
+version = 1
+
+[[executor_capacities]]
+agent_id = "host-claude"
+max_concurrent_jobs = 1
+
+[[executor_capacities]]
+agent_id = "host-codex"
+max_concurrent_jobs = 1

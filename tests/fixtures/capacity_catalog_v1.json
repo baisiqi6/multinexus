@@ -1,0 +1,15 @@
+{
+  "contract_version": 1,
+  "source_id": "multinexus.discord.capacity",
+  "source_version": 1,
+  "policies": [
+    {"agent_id": "mac-claude", "max_concurrent_jobs": 1},
+    {"agent_id": "mac-codex", "max_concurrent_jobs": 1},
+    {"agent_id": "mac-omp", "max_concurrent_jobs": 1},
+    {"agent_id": "mac-opencode", "max_concurrent_jobs": 1},
+    {"agent_id": "pad-jarvis", "max_concurrent_jobs": 1},
+    {"agent_id": "win-claude", "max_concurrent_jobs": 1},
+    {"agent_id": "win-openclaw", "max_concurrent_jobs": 1},
+    {"agent_id": "win-opencode", "max_concurrent_jobs": 1}
+  ]
+}

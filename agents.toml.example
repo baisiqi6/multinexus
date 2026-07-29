@@ -1,0 +1,112 @@
+# MultiNexus agent registry template.
+#
+# Copy this file to agents.toml, then fill in local paths, Discord IDs, and
+# token_env names for the host where the process runs. Keep agents.toml local
+# and uncommitted; real tokens belong in .env.
+#
+# For Coordinate-managed execution, set agentd_mode = true and provide
+# coordinator_cli_path pointing to the Coordinate CLI wrapper on this host.
+# The authority roster (id, display_name, discord_user_id) lives in
+# config/agent-registry.example.toml; copy it to config/agent-registry.toml and
+# keep it secret-free.
+
+[defaults]
+# Standalone foreground bridge: false. Coordinate-managed worker: true.
+agentd_mode = false
+
+# Coordinate CLI wrapper path. Uncomment and adjust only when using
+# Coordinate-managed execution. Must exist on the host running this process.
+# coordinator_cli_path = "/usr/local/bin/coord-local"
+
+# Local fallback for Coordinate job queue. In multi-host deployments, use a
+# shared Coordinate backend, not a local SQLite path accessed from many hosts.
+coordinator_db_path = "data/coordinator.sqlite3"
+
+context_db_path = "data/discord_context.sqlite3"
+context_recent_messages = 40
+context_budget_chars = 12000
+context_max_message_chars = 500
+context_ttl_seconds = 86400
+handoff_dedupe_seconds = 600
+respond_to_bots = true
+wiki_enabled = false
+wiki_path = "wiki"
+
+work_dir = "."
+
+timeout = 360
+first_byte_timeout = 120
+activity_timeout = 120
+
+# Optional safety gates. Fill with real Discord snowflakes in agents.toml.
+channels = []
+allowed_user_ids = []
+# coordinator_bot_id = 123456789012345678
+
+system_prompt = """
+You are {self_id}, a coding agent in the MultiNexus roster.
+
+Available peers: {available_peers}
+
+Use the project handoff protocol when delegating work to another agent. Never
+include secrets, private tokens, or local-only credentials in reports.
+"""
+
+# ---------------------------------------------------------------------------
+# Minimal portable example: one Claude agent.
+# ---------------------------------------------------------------------------
+[[agents]]
+id = "claude"
+adapter = "claude"
+display_name = "Claude"
+aliases = ["Claude"]
+token_env = "DISCORD_CLAUDE_TOKEN"
+work_dir = "."
+claude_bin = "claude"
+
+# ---------------------------------------------------------------------------
+# Optional examples (uncomment and duplicate per host as needed).
+# ---------------------------------------------------------------------------
+# [[agents]]
+# id = "codex"
+# adapter = "codex"
+# display_name = "Codex"
+# aliases = ["Codex"]
+# token_env = "DISCORD_CODEX_TOKEN"
+# work_dir = "."
+# codex_bin = "codex"
+#
+# [[agents]]
+# id = "host-opencode"
+# adapter = "opencode"
+# display_name = "OpenCode"
+# aliases = ["OpenCode"]
+# token_env = "DISCORD_OPENCODE_TOKEN"
+# work_dir = "."
+# opencode_bin = "opencode"
+# opencode_dangerously_skip_permissions = false
+#
+# [[agents]]
+# id = "host-omp"
+# adapter = "omp"
+# display_name = "OMP"
+# aliases = ["OMP"]
+# token_env = "DISCORD_OMP_TOKEN"
+# work_dir = "."
+# omp_bin = "omp"
+# omp_auto_approve = false
+
+# External agents are mentioned/routed but not managed by this MultiNexus
+# bridge process. They still need a discord_user_id to participate in the
+# Coordinate registry projection.
+# [[external_agents]]
+# id = "openclaw"
+# display_name = "OpenClaw"
+# aliases = ["OpenClaw"]
+# discord_user_id = "<discord-user-id>"
+#
+# [[external_agents]]
+# id = "hermes"
+# display_name = "Hermes"
+# aliases = ["Hermes"]
+# discord_user_id = "<discord-user-id>"
