@@ -120,6 +120,9 @@ class CoordinateRuntimeClient:
 
     def _base_env(self) -> dict[str, str]:
         env = os.environ.copy()
+        # Coordinate console script reads MULTI_AGENT_COORDINATOR_DB as its
+        # default --db; MAC_DB is retained for legacy wrappers.
+        env["MULTI_AGENT_COORDINATOR_DB"] = self.db_path
         env["MAC_DB"] = self.db_path
         return env
 

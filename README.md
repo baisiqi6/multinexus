@@ -83,6 +83,8 @@ washer.py（可选独立记忆提取）
   - [Claude Code CLI](https://docs.anthropic.com/claude-code)（`npm install -g @anthropic-ai/claude-code`）
   - [Codex CLI](https://github.com/openai/codex)（`npm install -g @openai/codex`）
   - [OpenCode](https://opencode.ai/)、OMP 或 Hermes CLI
+- 使用 Coordinate-managed profile 时，还需安装
+  [Coordinate](https://github.com/baisiqi6/coordinate)；standalone profile 不需要。
 
 ### 2. 克隆和安装
 
@@ -103,7 +105,20 @@ cp agents.toml.example agents.toml
 ```
 
 编辑 `.env` — 填入你的 Discord bot token。
-编辑 `agents.toml` — 按示例配置一个 `claude` agent。Coordinate-managed 运行需要另行设置 `coordinator_cli_path`。
+编辑 `agents.toml` — 按示例配置一个 `claude` agent。
+
+Coordinate-managed 运行还需要：
+
+```toml
+[defaults]
+agentd_mode = true
+coordinator_cli_path = "/absolute/path/to/coordinate/.venv/bin/coordinate"
+coordinator_db_path = "/absolute/path/to/coordinate/data/coordinator.sqlite3"
+```
+
+`coordinator_db_path` 必须是当前宿主机可访问的绝对路径，不能由多台宿主机直接共享。
+本地安装和不发送消息的一次性验证见
+[`docs/platform-setup.md`](docs/platform-setup.md#coordinate-managed-本地-no-send-验证)。
 
 完整演练见 [`docs/platform-setup.md`](docs/platform-setup.md)。
 

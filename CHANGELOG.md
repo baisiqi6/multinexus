@@ -4,6 +4,14 @@ multinexus 的所有重要变更都记录在这里。
 
 ---
 
+## [0.1.1] — 2026-07-29
+
+- 修复 Coordinate-managed direct console-script 路径下 `coordinator_db_path` 未传给
+  `MULTI_AGENT_COORDINATOR_DB`、可能静默落入默认数据库的问题；
+- 保留 `MAC_DB` 以兼容既有 wrapper，并增加 subprocess env 回归测试；
+- 补充 Coordinate fresh install、绝对 DB 路径和不连接 Discord/不调用 provider 的
+  no-send 一次性验证说明。
+
 ## [0.1.0] — 2026-07-29
 
 首个 MultiNexus clean export：

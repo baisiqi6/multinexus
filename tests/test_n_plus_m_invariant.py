@@ -238,19 +238,19 @@ class TestCoordinateRuntimeBoundary(unittest.TestCase):
     """Verify the bridge -> coordinate -> agentd flow."""
 
     def test_coordinate_client_submit_request(self):
-        """CoordinateRuntimeClient builds correct CLI command."""
+        """CoordinateRuntimeClient builds the command and passes both DB env vars."""
         from multinexus.agentd.coordinate_client import CoordinateRuntimeClient
 
         client = CoordinateRuntimeClient(
-            cli_path="/bin/echo",
-            db_path="/tmp/test.db",
+            cli_path="/path/to/.venv/bin/coordinate",
+            db_path="/path/to/coordinator.sqlite3",
         )
 
         import subprocess
-        commands_seen = []
+        calls_seen = []
 
         def mock_run(cmd, **kwargs):
-            commands_seen.append(cmd)
+            calls_seen.append((cmd, kwargs))
             return subprocess.CompletedProcess(cmd, 0, stdout='{"result": {"job": {"id": "request:test"}}}', stderr="")
 
         with patch("multinexus.agentd.coordinate_client.subprocess.run", side_effect=mock_run):
@@ -267,8 +267,8 @@ class TestCoordinateRuntimeBoundary(unittest.TestCase):
             finally:
                 loop.close()
 
-        self.assertEqual(len(commands_seen), 1)
-        cmd = commands_seen[0]
+        self.assertEqual(len(calls_seen), 1)
+        cmd, kwargs = calls_seen[0]
         self.assertIn("runtime", cmd)
         self.assertIn("request", cmd)
         self.assertIn("submit", cmd)
@@ -276,6 +276,11 @@ class TestCoordinateRuntimeBoundary(unittest.TestCase):
         self.assertIn("--target-agent", cmd)
         self.assertIn("mac-codex", cmd)
         self.assertEqual(result.get("result", {}).get("job", {}).get("id"), "request:test")
+
+        env = kwargs.get("env")
+        self.assertIsNotNone(env)
+        self.assertEqual(env["MULTI_AGENT_COORDINATOR_DB"], "/path/to/coordinator.sqlite3")
+        self.assertEqual(env["MAC_DB"], "/path/to/coordinator.sqlite3")
 
     def test_coordinate_client_builds_submit_command(self):
         """Verify the submit command includes all required args."""

@@ -5,7 +5,8 @@
 # and uncommitted; real tokens belong in .env.
 #
 # For Coordinate-managed execution, set agentd_mode = true and provide
-# coordinator_cli_path pointing to the Coordinate CLI wrapper on this host.
+# coordinator_cli_path pointing either to an installed Coordinate console
+# script on this host or to a reviewed wrapper.
 # The authority roster (id, display_name, discord_user_id) lives in
 # config/agent-registry.example.toml; copy it to config/agent-registry.toml and
 # keep it secret-free.
@@ -14,12 +15,13 @@
 # Standalone foreground bridge: false. Coordinate-managed worker: true.
 agentd_mode = false
 
-# Coordinate CLI wrapper path. Uncomment and adjust only when using
-# Coordinate-managed execution. Must exist on the host running this process.
-# coordinator_cli_path = "/usr/local/bin/coord-local"
+# Direct local install example (macOS/Linux). Windows uses
+# C:\absolute\path\to\coordinate\.venv\Scripts\coordinate.exe.
+# coordinator_cli_path = "/absolute/path/to/coordinate/.venv/bin/coordinate"
 
-# Local fallback for Coordinate job queue. In multi-host deployments, use a
-# shared Coordinate backend, not a local SQLite path accessed from many hosts.
+# Standalone mode may keep this relative fallback. Coordinate-managed mode
+# must replace it with an absolute host-local SQLite path. Never point multiple
+# hosts directly at one SQLite file.
 coordinator_db_path = "data/coordinator.sqlite3"
 
 context_db_path = "data/discord_context.sqlite3"

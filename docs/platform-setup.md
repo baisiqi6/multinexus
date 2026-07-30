@@ -99,6 +99,75 @@ claude_bin = "claude"
 
 Coordinate-managed 运行需要另行设置 `coordinator_cli_path` 和 `agentd_mode = true`，并在每个 agent 主机上运行 `python -m multinexus.agentd --agent <id>`。
 
+### Coordinate-managed 本地 no-send 验证
+
+先按 [Coordinate README](https://github.com/baisiqi6/coordinate) 在本机完成 fresh install。
+Coordinate-managed profile 的三个关键值是：
+
+- `agentd_mode = true`；
+- `coordinator_cli_path`：本机安装生成的 `coordinate` console script 绝对路径；
+- `coordinator_db_path`：当前宿主机独占访问的绝对 SQLite 路径。
+
+下面用全新的临时目录、临时 DB 和临时配置注册本地记录，并对空队列执行一次 claim。它不会启动
+长期 agentd、调用 provider、读取 Discord token、连接或发送 Discord：
+
+```bash
+COORDINATE_REPO="/absolute/path/to/coordinate"
+MULTINEXUS_REPO="$(pwd -P)"
+COORDINATE_CLI="$COORDINATE_REPO/.venv/bin/coordinate"
+A2_ROOT="$(mktemp -d)"
+COORDINATE_DB="$A2_ROOT/coordinator.sqlite3"
+HARNESS_ROOT="$A2_ROOT/harness"
+A2_CONFIG="$A2_ROOT/agents.toml"
+
+mkdir -p "$HARNESS_ROOT"
+cat > "$A2_CONFIG" <<EOF
+[defaults]
+agentd_mode = true
+coordinator_cli_path = "$COORDINATE_CLI"
+coordinator_db_path = "$COORDINATE_DB"
+work_dir = "$MULTINEXUS_REPO"
+
+[[agents]]
+id = "claude"
+adapter = "claude"
+display_name = "Claude"
+aliases = ["Claude"]
+token_env = "DISCORD_CLAUDE_TOKEN"
+work_dir = "$MULTINEXUS_REPO"
+claude_bin = "claude"
+EOF
+
+"$COORDINATE_CLI" --db "$COORDINATE_DB" workspace add a2-local \
+  --path "$MULTINEXUS_REPO" --harness-root "$HARNESS_ROOT"
+"$COORDINATE_CLI" --db "$COORDINATE_DB" workspace host-profile set a2-local \
+  --host-id local-a2 --workspace-path "$MULTINEXUS_REPO" \
+  --harness-root "$HARNESS_ROOT" \
+  --coordinator-cli-path "$COORDINATE_CLI" \
+  --coordinator-db-path "$COORDINATE_DB"
+"$COORDINATE_CLI" --db "$COORDINATE_DB" runtime agent register \
+  --agent-id claude --host-id local-a2 --client-type agentd
+
+.venv/bin/python - "$A2_CONFIG" <<'PY'
+import asyncio
+import sys
+
+from multinexus.agentd.coordinate_client import CoordinateRuntimeClient
+from multinexus.config import load_config
+
+cfg = load_config(["--config", sys.argv[1], "--agent", "claude"], require_token=False)
+result = asyncio.run(CoordinateRuntimeClient(
+    cli_path=cfg.coordinator_cli_path,
+    db_path=cfg.coordinator_db_path,
+).claim_job(agent_id=cfg.id))
+assert result.get("claimed") is False, result
+print("NO_SEND_CLAIM_OK", result)
+PY
+```
+
+若结果不是 `claimed=false`，立即停止：这表示你没有使用预期的全新 DB，或其中已经存在 job。
+不要把这个 smoke 改成长时间运行的 agentd，也不要在本步骤填入真实 token。
+
 ---
 
 ## 步骤 4：安装 CLI Agents（可选）
