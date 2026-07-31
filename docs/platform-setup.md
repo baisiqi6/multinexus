@@ -64,6 +64,37 @@ pip install -r requirements.txt
 
 ## 步骤 3：配置
 
+### 推荐：Standalone 单 agent 向导
+
+第一次试用时，优先从最小路径开始：一个 Discord Bot、一个授权频道、一个授权用户和一个
+本机 executor。进入仓库并激活 virtualenv 后运行：
+
+```bash
+python -m multinexus.setup
+```
+
+向导会逐项询问 agent、executor、绝对 work dir、channel ID、user ID，并通过隐藏输入读取
+Bot Token。它只在当前目录生成 `.env` 和 `agents.toml`；不会创建 Discord Application、邀请
+Bot、验证远端 token 或调用 agent provider。若检测到现有 `agents.toml`，它不会覆盖，而是转为
+sanitized check。
+
+配置后可重复运行只读检查：
+
+```bash
+python -m multinexus.setup --check
+```
+
+检查成功后启动：
+
+```bash
+python multinexus.py --platform discord --config agents.toml
+```
+
+向导当前只覆盖 Standalone + Discord + 单 agent。需要 Coordinate-managed、多 agent 或多宿主机
+拓扑时，继续使用下面的手工配置路径。
+
+### 高级：手工配置
+
 ```bash
 cp .env.example .env
 cp agents.toml.example agents.toml

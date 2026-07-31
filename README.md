@@ -99,6 +99,24 @@ pip install -r requirements.txt
 
 ### 3. 配置
 
+**推荐：Standalone 首次配置向导**
+
+如果你只想先连接一个 Discord Bot 和一个本机 agent CLI，运行：
+
+```bash
+python -m multinexus.setup
+```
+
+向导会提示你在 Discord Developer Portal 完成人工步骤，隐藏读取 Bot Token，生成单 agent
+`agents.toml` 与 owner-only `.env`，并在本地执行只读检查。它不会替你创建或邀请 Bot，也不会
+调用 Discord/provider API。配置完成后可随时复查：
+
+```bash
+python -m multinexus.setup --check
+```
+
+**高级：Coordinate-managed / 多 agent 手工配置**
+
 ```bash
 cp .env.example .env
 cp agents.toml.example agents.toml
@@ -120,7 +138,7 @@ coordinator_db_path = "/absolute/path/to/coordinate/data/coordinator.sqlite3"
 本地安装和不发送消息的一次性验证见
 [`docs/platform-setup.md`](docs/platform-setup.md#coordinate-managed-本地-no-send-验证)。
 
-完整演练见 [`docs/platform-setup.md`](docs/platform-setup.md)。
+完整配置与演练见 [`docs/platform-setup.md`](docs/platform-setup.md)。
 
 ### 4. 运行
 

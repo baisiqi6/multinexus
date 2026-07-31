@@ -4,6 +4,13 @@ multinexus 的所有重要变更都记录在这里。
 
 ---
 
+## [0.1.2] — 2026-07-30
+
+- 新增 `python -m multinexus.setup`，引导首次用户完成 Standalone + Discord + 单 agent 配置；
+- 新增 `python -m multinexus.setup --check`，在不连接 Discord/provider 的前提下检查本地配置；
+- Bot Token 通过隐藏输入读取，只写入 owner-only `.env`，不进入 argv、TOML 或输出；
+- 检测到现有 `agents.toml` 时默认不覆盖，转为 sanitized check。
+
 ## [0.1.1] — 2026-07-29
 
 - 修复 Coordinate-managed direct console-script 路径下 `coordinator_db_path` 未传给
