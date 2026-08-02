@@ -57,6 +57,14 @@ class AgentConfig:
     omp_model: str | None = None
     omp_thinking: str | None = None
     omp_auto_approve: bool = True
+    qoder_bin: str = "qodercli"
+    qoder_reasoning_effort: str | None = None
+    qoder_permission_mode: str = "dont_ask"
+    grok_bin: str = "grok"
+    grok_reasoning_effort: str | None = None
+    grok_permission_mode: str = "dontAsk"
+    acp_command: str = ""
+    acp_args: list[str] = field(default_factory=list)
     allowed_user_ids: list[int] = field(default_factory=list)
     wiki_enabled: bool = False
     wiki_path: str = "wiki"

@@ -2,7 +2,7 @@
 
 > 本仓库基于 [`baisiqi6/discord-nexus`](https://github.com/baisiqi6/discord-nexus) 继续维护。原项目 README 标注为 MIT License，但没有独立 LICENSE 文件。来源与维护说明见 [docs/provenance.md](docs/provenance.md)。
 
-MultiNexus 是一个 agent 执行织物，用于将可替换的托管和外部 agent 运行时 — 包括 Claude Code、Codex、OpenCode、Hermes 和 OMP — 连接到持久的项目工作。
+MultiNexus 是一个 agent 执行织物，用于将可替换的托管和外部 agent 运行时 — 包括 Claude Code、Codex、Qoder、Grok Build、OpenCode、Hermes、OMP 和支持 ACP v1 的 agent — 连接到持久的项目工作。
 
 它顶层与 Coordinate 项目协调内核、项目 Harness 和当前 Operator 共同工作：
 
@@ -46,7 +46,7 @@ multinexus.py --platform discord --config agents.toml
       └── multinexus/client.py  DiscordBridge → [每个 agent 一个 DiscordClient]
             │   每个 agent 是自己的 Discord 身份
             │
-            ├── multinexus/adapters/        Claude / Codex / OpenCode / OMP / local LLM
+            ├── multinexus/adapters/        ACP / Claude / Codex / Qoder / Grok / OpenCode / OMP 网关
             ├── multinexus/agentd/          Coordinate agent worker 运行时
             ├── multinexus/sessions/        per-scope 会话持久化
             ├── multinexus/commands.py      operator 命令处理器（文本）
@@ -82,6 +82,8 @@ washer.py（可选独立记忆提取）
 - 至少一个受支持的 CLI executor：
   - [Claude Code CLI](https://docs.anthropic.com/claude-code)（`npm install -g @anthropic-ai/claude-code`）
   - [Codex CLI](https://github.com/openai/codex)（`npm install -g @openai/codex`）
+  - Qoder CLI 或 Grok Build CLI（可选，当前走 direct JSON adapter）
+  - 任意提供 stdio ACP v1 server 的 agent CLI（可选）
   - [OpenCode](https://opencode.ai/)、OMP 或 Hermes CLI
 - 使用 Coordinate-managed profile 时，还需安装
   [Coordinate](https://github.com/baisiqi6/coordinate)；standalone profile 不需要。
@@ -140,6 +142,45 @@ coordinator_db_path = "/absolute/path/to/coordinate/data/coordinator.sqlite3"
 
 完整配置与演练见 [`docs/platform-setup.md`](docs/platform-setup.md)。
 
+**通用 ACP v1 adapter（当前不在 Standalone 向导内）：**
+
+```toml
+[[agents]]
+id = "kimi-acp"
+adapter = "acp"
+display_name = "Kimi via ACP"
+token_env = "DISCORD_KIMI_ACP_TOKEN"
+work_dir = "."
+acp_command = "/absolute/path/to/kimi"
+acp_args = ["acp"]
+```
+
+`acp_command` 应使用绝对路径；`acp_args` 是参数数组，不会出现在 health payload 中。当前
+adapter 固定使用 ACP v1，支持 fresh session 和由 provider capability 声明的 resume/load，
+默认拒绝 permission request，也不向 provider 声明 filesystem、terminal 或 terminal-auth
+能力。因此这一版适合先验证安全的文本通信；需要 agent 执行工具的场景仍应使用现有 direct
+adapter，直到后续引入显式、可审计的 ACP permission policy。
+
+provider 的登录流程由用户在 MultiNexus 外完成，不由 adapter 自动执行。例如 Kimi Code 可先运行：
+
+```bash
+kimi acp --login
+```
+
+详细说明与故障排查见 [`docs/platform-setup.md`](docs/platform-setup.md#通用-acp-v1-agent)。
+
+**Qoder / Grok Build（当前不在 Standalone 向导内）：**
+
+当前 Qoder 1.1.x 和 Grok Build 0.2.x 没有 stdio ACP server，分别使用 `adapter = "qoder"`
+与 `adapter = "grok"` 的 direct JSON 路径。它们与 ACP 共用 `AgentAdapter` / `AdapterResult`
+上层契约，并支持显式 session resume（fresh 会话返回 provider session ID，后续以
+`--resume <session-id>` 恢复）；direct adapter 不会因 ACP 存在而删除。安装、登录、
+安全 permission 默认值与配置示例见
+[`docs/platform-setup.md`](docs/platform-setup.md#qoder-cli)。
+
+> 上述三类 adapter 不在 `python -m multinexus.setup` 的 Standalone 向导选项内；手工配置后
+> 可随时用 `python -m multinexus.setup --check` 做只读复查。
+
 ### 4. 运行
 
 ```bash
@@ -161,7 +202,7 @@ python multinexus.py --platform discord --config agents.toml
 |---|---|
 | 多 agent 路由 | 每个 agent 是自己的 Discord 身份；消息路由到配置的 agent |
 | `[handoff]` 协议 | Agent 通过响应中的 `[handoff] <@agent>` 行相互交接任务 |
-| 会话持久化 | Per-scope 的 Claude/Codex 会话在后续消息中恢复 |
+| 会话持久化 | Per-scope 的 Claude/Codex/Qoder/Grok/ACP 会话在后续消息中恢复 |
 | Per-thread 历史 | 对话历史按 thread/channel 存储在 SQLite 中 |
 | 分块输出 | 响应在发布前被拆分为 Discord 大小的块 |
 | Operator 命令 | 文本命令：`agents`（列表）、`health`（检查）、`session status`、`session reset` |
@@ -212,6 +253,9 @@ E4B_MODEL=gemma-3-4b-it
 | `opencode` | OpenCode CLI 子进程 | 否 |
 | `omp` | Oh My Pi CLI 子进程 | 否 |
 | `hermes` | Hermes CLI one-shot 子进程 | 否 |
+| `qoder` | Qoder CLI direct JSON 子进程 | 否 |
+| `grok` | Grok Build CLI direct JSON 子进程 | 否 |
+| `acp` | 任意 stdio ACP v1 agent server | 否 |
 
 必须至少配置一个 agent 并在线。见 [`docs/agents.md`](docs/agents.md)。
 
@@ -236,6 +280,9 @@ E4B_MODEL=gemma-3-4b-it
 |---|---|---|
 | `claude` | Anthropic API（云端） | 是 — prompt 发送到 Anthropic |
 | `codex` | OpenAI API（云端） | 是 — prompt 发送到 OpenAI |
+| `qoder` | 取决于 Qoder 当前 provider/model | 通常是 |
+| `grok` | 取决于 Grok Build 当前 provider/model | 通常是 |
+| `acp` | 取决于你配置的 ACP provider | 取决于 provider |
 | `opencode` / `omp` / `hermes` | 取决于对应 CLI 的 provider 配置 | 可能；请检查所选 provider |
 
 **无论你使用哪些 agent，都保持本地的内容：**

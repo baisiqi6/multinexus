@@ -5,3 +5,4 @@ pyyaml>=6.0
 python-dotenv>=1.0.0
 croniter>=2.0
 khl.py==0.3.17
+agent-client-protocol==0.11.1

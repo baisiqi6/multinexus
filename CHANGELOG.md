@@ -4,6 +4,18 @@ multinexus 的所有重要变更都记录在这里。
 
 ---
 
+## [0.1.3] — 2026-08-02
+
+- 新增 generic ACP v1 adapter（`adapter = "acp"`）：通过 stdio 连接任意 ACP v1 agent
+  server，支持 fresh session 与按 provider capability 声明的 resume/load 文本会话；
+  默认拒绝 permission request，且不向 provider 声明 filesystem、terminal 或
+  terminal-auth 能力，也不执行任何 tool；
+- 新增 Qoder（`adapter = "qoder"`）与 Grok Build（`adapter = "grok"`）direct JSON
+  adapters，支持 fresh 与显式 `--resume` 文本会话；Grok 固定使用 `--no-memory` 关闭
+  provider-native 跨 session memory，其 JSON 中的 `thought` 字段不转发；
+- 固定依赖 `agent-client-protocol==0.11.1`；
+- 现有 direct adapters（Claude/Codex/OpenCode/OMP/Hermes）继续保留。
+
 ## [0.1.2] — 2026-07-30
 
 - 新增 `python -m multinexus.setup`，引导首次用户完成 Standalone + Discord + 单 agent 配置；

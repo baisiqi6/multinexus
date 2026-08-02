@@ -98,6 +98,53 @@ claude_bin = "claude"
 # omp_bin = "omp"
 # omp_auto_approve = false
 
+# Qoder 1.1.x currently uses its headless JSON CLI contract rather than ACP.
+# Authentication is completed in Qoder before MultiNexus starts. The default
+# dont_ask mode fails closed when a tool needs interactive approval.
+#
+# [[agents]]
+# id = "host-qoder"
+# adapter = "qoder"
+# display_name = "Qoder"
+# aliases = ["Qoder"]
+# token_env = "DISCORD_QODER_TOKEN"
+# work_dir = "."
+# qoder_bin = "qodercli"
+# model = "<model-id-from-qodercli --list-models>"
+# qoder_reasoning_effort = "high"
+# qoder_permission_mode = "dont_ask"
+#
+# Grok Build 0.2.x currently uses its headless JSON CLI contract rather than
+# ACP. Provider-native cross-session memory is disabled by the adapter to avoid
+# project contamination; Grok's internal subagent capability remains available.
+#
+# [[agents]]
+# id = "host-grok"
+# adapter = "grok"
+# display_name = "Grok"
+# aliases = ["Grok"]
+# token_env = "DISCORD_GROK_TOKEN"
+# work_dir = "."
+# grok_bin = "grok"
+# model = "<model-id-from-grok-models>"
+# grok_reasoning_effort = "high"
+# grok_permission_mode = "dontAsk"
+#
+# Generic ACP v1 example. Keep this block commented until the agent has its own
+# Discord bot identity and token_env. Authentication is performed out of band;
+# the adapter never launches a terminal-auth flow. For Kimi Code, run
+# `kimi acp --login` interactively first.
+#
+# [[agents]]
+# id = "host-acp"
+# adapter = "acp"
+# display_name = "ACP Agent"
+# aliases = ["ACP"]
+# token_env = "DISCORD_ACP_TOKEN"
+# work_dir = "."
+# acp_command = "/absolute/path/to/your-acp-cli"
+# acp_args = ["acp"]
+
 # External agents are mentioned/routed but not managed by this MultiNexus
 # bridge process. They still need a discord_user_id to participate in the
 # Coordinate registry projection.

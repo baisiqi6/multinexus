@@ -1,6 +1,6 @@
 # Agent Adapters
 
-当前 Discord bridge 和 `agentd` 通过 `multinexus/adapters/factory.py` 支持五类
+当前 Discord bridge 和 `agentd` 通过 `multinexus/adapters/factory.py` 支持八类
 managed adapter：
 
 | `adapter` | Executor | 会话恢复 |
@@ -10,6 +10,9 @@ managed adapter：
 | `opencode` | OpenCode CLI | 支持 |
 | `omp` | Oh My Pi CLI | 支持 |
 | `hermes` | Hermes CLI | 当前为 one-shot |
+| `acp` | 任意 stdio ACP v1 agent server | 支持 |
+| `qoder` | Qoder CLI direct JSON 子进程 | 支持 |
+| `grok` | Grok Build CLI direct JSON 子进程 | 支持 |
 
 每个 `[[agents]]` 条目代表一个独立的平台 bot 身份；`token_env` 指向该身份的
 Discord token 环境变量。只配置已安装并已认证的 executor。
@@ -86,6 +89,56 @@ hermes_bin = "hermes"
 # hermes_toolsets = "<toolsets>"
 hermes_accept_hooks = false
 ```
+
+## 通用 ACP v1 adapter
+
+`ACPAdapter` 保留现有 `AgentAdapter` / `AdapterResult` 抽象，只把 ACP 当作一个统一的
+transport implementation；现有 direct adapters 不会因此删除。
+
+```toml
+adapter = "acp"
+acp_command = "/absolute/path/to/acp-cli"
+acp_args = ["acp"]
+```
+
+当前默认 permission policy 是 deny，且不向 provider 声明 filesystem、terminal 或
+terminal-auth capability。它适合文本通信与 session/resume 验证；coding tool
+authorization 尚未开放。最小配置、登录与故障排查见
+[`platform-setup.md#通用-acp-v1-agent`](platform-setup.md#通用-acp-v1-agent)。
+
+## Qoder 与 Grok Build direct adapters
+
+当前 Qoder 1.1.x 与 Grok Build 0.2.x CLI 没有暴露稳定的 stdio ACP server，所以两者暂时走
+direct adapter：
+
+- `QoderAdapter` 使用 `qodercli -p --output-format json`；
+- `GrokAdapter` 使用 `grok --single ... --output-format json`；
+- fresh turn 返回 provider session ID，后续通过显式 `--resume <session-id>` 恢复；
+- 两者都返回统一的 `AdapterResult`，上层 session、agentd 和 bridge 不需要 provider 分支；
+- 默认 permission mode 为 fail-closed，只有用户在 `agents.toml` 显式修改时才放宽；
+- Grok provider-native memory 默认关闭（固定 `--no-memory`），避免跨项目污染，但不关闭
+  其内部 subagent 能力；
+- Grok JSON 中可能出现的 `thought` 字段会被忽略，不进入结果、进度、metadata 或日志。
+
+```toml
+adapter = "qoder"
+qoder_bin = "qodercli"
+qoder_permission_mode = "dont_ask"
+```
+
+```toml
+adapter = "grok"
+grok_bin = "grok"
+grok_permission_mode = "dontAsk"
+```
+
+这不是另起一套协议。`AgentAdapter` 是稳定端口，ACP 与 direct adapters 是可替换的 transport
+implementation。未来 provider 真正暴露可靠的 ACP server 时，可以逐个验证迁移；direct
+adapter 继续作为兼容与后备路径。
+
+完整配置见
+[`platform-setup.md#qoder-cli`](platform-setup.md#qoder-cli) 和
+[`platform-setup.md#grok-build-cli`](platform-setup.md#grok-build-cli)。
 
 ## External agents
 

@@ -239,6 +239,36 @@ def _load_toml_agent(
         omp_model=str(merged["omp_model"]) if merged.get("omp_model") else None,
         omp_thinking=str(merged["omp_thinking"]) if merged.get("omp_thinking") else None,
         omp_auto_approve=_as_bool(merged.get("omp_auto_approve"), True),
+        qoder_bin=_first_existing_command(
+            os.getenv("QODER_BIN"),
+            str(merged.get("qoder_bin", "")),
+            shutil.which("qodercli"),
+            "qodercli",
+        ),
+        qoder_reasoning_effort=(
+            str(merged["qoder_reasoning_effort"])
+            if merged.get("qoder_reasoning_effort")
+            else None
+        ),
+        qoder_permission_mode=str(
+            merged.get("qoder_permission_mode", "dont_ask")
+        ),
+        grok_bin=_first_existing_command(
+            os.getenv("GROK_BIN"),
+            str(merged.get("grok_bin", "")),
+            shutil.which("grok"),
+            "grok",
+        ),
+        grok_reasoning_effort=(
+            str(merged["grok_reasoning_effort"])
+            if merged.get("grok_reasoning_effort")
+            else None
+        ),
+        grok_permission_mode=str(
+            merged.get("grok_permission_mode", "dontAsk")
+        ),
+        acp_command=str(merged.get("acp_command", "")),
+        acp_args=_as_list(merged.get("acp_args")),
         wiki_enabled=_as_bool(merged.get("wiki_enabled"), False),
         wiki_path=str(merged.get("wiki_path", "wiki")),
         discoveries_channel_id=(

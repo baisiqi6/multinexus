@@ -38,6 +38,13 @@ EXECUTOR_CHOICES = {
     "5": "hermes",
     **{name: name for name in EXECUTORS},
 }
+# Check-only adapters: verifiable by --check but intentionally NOT creatable by
+# the interactive wizard (EXECUTOR_CHOICES stays at five entries).
+CHECK_EXECUTORS = {
+    "qoder": ("qoder_bin", "qodercli"),
+    "grok": ("grok_bin", "grok"),
+    "acp": ("acp_command", ""),
+}
 AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -262,7 +269,7 @@ def check_configuration(root: Path | str, *, out: TextIO = sys.stdout) -> int:
             _print(f"OK agent {label} work_dir: exists", out=out)
 
         executor = str(merged.get("adapter", "")).strip().lower()
-        executor_spec = EXECUTORS.get(executor)
+        executor_spec = EXECUTORS.get(executor) or CHECK_EXECUTORS.get(executor)
         if executor_spec is None:
             errors += 1
             _print(f"ERROR agent {label} executor: unsupported ({executor or 'missing'})", out=out)

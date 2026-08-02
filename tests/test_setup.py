@@ -12,6 +12,7 @@ from multinexus.config import load_config
 from multinexus.setup import (
     CHECK_INVALID,
     CHECK_OK,
+    EXECUTOR_CHOICES,
     _atomic_write_text,
     check_configuration,
     run_setup,
@@ -235,19 +236,36 @@ class TestSetupCheck(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def _write_config(self, *, token: str = "present.token", binary: str = "claude") -> None:
+    def _write_config(
+        self,
+        *,
+        token: str = "present.token",
+        binary: str = "claude",
+        adapter: str = "claude",
+        binary_field: str = "claude_bin",
+    ) -> None:
+        lines = [
+            "[defaults]",
+            "agentd_mode = false",
+            "",
+            "[[agents]]",
+            'id = "demo"',
+            f'adapter = "{adapter}"',
+            'display_name = "Demo"',
+            'token_env = "DISCORD_DEMO_TOKEN"',
+            f'work_dir = "{self.work_dir}"',
+        ]
+        if binary_field is not None:
+            lines.append(f'{binary_field} = "{binary}"')
+        lines.extend(
+            [
+                "channels = [123456789012345678]",
+                "allowed_user_ids = [223456789012345678]",
+                "",
+            ]
+        )
         (self.root / "agents.toml").write_text(
-            "[defaults]\n"
-            "agentd_mode = false\n\n"
-            "[[agents]]\n"
-            'id = "demo"\n'
-            'adapter = "claude"\n'
-            'display_name = "Demo"\n'
-            'token_env = "DISCORD_DEMO_TOKEN"\n'
-            f'work_dir = "{self.work_dir}"\n'
-            f'claude_bin = "{binary}"\n'
-            "channels = [123456789012345678]\n"
-            "allowed_user_ids = [223456789012345678]\n",
+            "\n".join(lines),
             encoding="utf-8",
         )
         (self.root / ".env").write_text(
@@ -324,6 +342,84 @@ class TestSetupCheck(unittest.TestCase):
         self.assertEqual(code, CHECK_OK)
         self.assertIn("WARNING channels", output.getvalue())
         self.assertIn("WARNING allowed_user_ids", output.getvalue())
+
+    def test_check_accepts_manually_configured_qoder(self):
+        self._write_config(adapter="qoder", binary="qodercli", binary_field="qoder_bin")
+        output = io.StringIO()
+
+        with patch(
+            "multinexus.setup.shutil.which",
+            side_effect=lambda binary: (
+                "/usr/local/bin/qodercli" if binary == "qodercli" else None
+            ),
+        ):
+            code = check_configuration(self.root, out=output)
+
+        self.assertEqual(code, CHECK_OK)
+        self.assertIn("executor: available (qoder)", output.getvalue())
+
+    def test_check_accepts_manually_configured_grok(self):
+        self._write_config(adapter="grok", binary="grok", binary_field="grok_bin")
+        output = io.StringIO()
+
+        with patch(
+            "multinexus.setup.shutil.which",
+            side_effect=lambda binary: (
+                "/usr/local/bin/grok" if binary == "grok" else None
+            ),
+        ):
+            code = check_configuration(self.root, out=output)
+
+        self.assertEqual(code, CHECK_OK)
+        self.assertIn("executor: available (grok)", output.getvalue())
+
+    def test_check_accepts_manually_configured_acp(self):
+        self._write_config(adapter="acp", binary="acp", binary_field="acp_command")
+        output = io.StringIO()
+
+        with patch(
+            "multinexus.setup.shutil.which",
+            side_effect=lambda binary: (
+                "/usr/local/bin/acp" if binary == "acp" else None
+            ),
+        ):
+            code = check_configuration(self.root, out=output)
+
+        self.assertEqual(code, CHECK_OK)
+        self.assertIn("executor: available (acp)", output.getvalue())
+
+    def test_check_rejects_acp_without_explicit_command(self):
+        for binary_field in (None, "acp_command"):
+            with self.subTest(binary_field=binary_field):
+                self._write_config(
+                    adapter="acp",
+                    binary="",
+                    binary_field=binary_field,
+                )
+                output = io.StringIO()
+
+                with patch(
+                    "multinexus.setup.shutil.which",
+                    return_value="/usr/local/bin/acp",
+                ):
+                    code = check_configuration(self.root, out=output)
+
+                self.assertEqual(code, CHECK_INVALID)
+                self.assertIn("executor: missing", output.getvalue())
+
+    def test_check_rejects_unknown_adapter(self):
+        self._write_config(adapter="unknown", binary_field=None)
+        output = io.StringIO()
+
+        code = check_configuration(self.root, out=output)
+
+        self.assertEqual(code, CHECK_INVALID)
+        self.assertIn("executor: unsupported", output.getvalue())
+
+    def test_check_only_adapters_are_not_wizard_choices(self):
+        for adapter in ("qoder", "grok", "acp"):
+            with self.subTest(adapter=adapter):
+                self.assertNotIn(adapter, EXECUTOR_CHOICES)
 
 
 if __name__ == "__main__":

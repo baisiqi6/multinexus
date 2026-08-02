@@ -217,6 +217,119 @@ npm install -g @openai/codex
 # 将 OPENAI_API_KEY 添加到 .env
 ```
 
+### Qoder CLI
+
+Qoder 当前通过 direct JSON adapter 接入。先在 MultiNexus 外完成 Qoder 登录，再确认：
+
+```bash
+command -v qodercli
+qodercli --version
+qodercli --list-models
+```
+
+model 名必须使用 `--list-models` 返回的当前精确值：
+
+```toml
+[[agents]]
+id = "qoder"
+adapter = "qoder"
+display_name = "Qoder"
+token_env = "DISCORD_QODER_TOKEN"
+work_dir = "."
+qoder_bin = "/absolute/path/to/qodercli"
+model = "<model-id-from-qodercli --list-models>"
+qoder_reasoning_effort = "high"
+qoder_permission_mode = "dont_ask"
+```
+
+`dont_ask` 是非交互 fail-closed，不是自动批准。若任务需要写文件或运行命令，必须由用户在
+本机配置中显式选择更宽的 Qoder permission mode，并把该配置视为执行 authority；不要把
+真实 token 写进 TOML。
+
+### Grok Build CLI
+
+Grok Build 当前也通过 direct JSON adapter 接入。先在 MultiNexus 外完成登录并检查当前模型：
+
+```bash
+command -v grok
+grok --version
+grok models
+grok inspect
+```
+
+`grok inspect` 会显示当前目录实际加载的 rules、skills、plugins、MCP 和 permissions；它不一定
+是 bare runtime。最小配置：
+
+```toml
+[[agents]]
+id = "grok"
+adapter = "grok"
+display_name = "Grok"
+token_env = "DISCORD_GROK_TOKEN"
+work_dir = "."
+grok_bin = "/absolute/path/to/grok"
+model = "<model-id-from-grok-models>"
+grok_reasoning_effort = "high"
+grok_permission_mode = "dontAsk"
+```
+
+adapter 固定添加 `--no-memory`，避免 provider-native 跨 session memory 污染其他项目；它不会
+关闭 Grok 的内部 subagent。默认 `dontAsk` fail-closed，放宽 permission 同样必须是本地显式
+决策。Grok 的 JSON 可能包含 `thought`，MultiNexus 只读取最终 `text`、session、stop reason
+和 bounded model evidence，不保存或转发私有思考。
+
+Qoder/Grok 当前版本没有 stdio ACP server，因此不能只把它们的普通 CLI command 填进
+`acp_command`。未来 provider 提供稳定 ACP 后，再按通用 ACP 路径逐个迁移验证。
+
+### 通用 ACP v1 Agent
+
+MultiNexus 可以把任意提供 stdio ACP v1 server 的 CLI 作为 `adapter = "acp"` 接入，而不为
+每个 provider 新增专属 adapter：
+
+```toml
+[[agents]]
+id = "kimi-acp"
+adapter = "acp"
+display_name = "Kimi via ACP"
+token_env = "DISCORD_KIMI_ACP_TOKEN"
+work_dir = "."
+acp_command = "/absolute/path/to/kimi"
+acp_args = ["acp"]
+```
+
+配置规则：
+
+- `acp_command` 使用宿主机上的绝对 executable 路径；
+- `acp_args` 只放启动 ACP server 所需参数，不放 token；
+- provider 登录在 MultiNexus 外人工完成；Kimi Code 示例为 `kimi acp --login`；
+- health check 只检查 executable 是否可解析，不连接 provider，也不回显参数；
+- adapter 固定协商 ACP v1，并只按 provider 声明的 capability 执行 resume/load；
+- 默认不声明 filesystem、terminal、terminal-auth capability，并拒绝所有 permission request。
+
+最后一条意味着当前 ACP 以安全文本通信为目标，不自动授权 coding tools。需要工具执行时继续
+使用现有 direct adapter；后续只有在具备显式 allowlist 与独立审查后，才会增加 ACP permission
+policy。
+
+只读检查：
+
+```bash
+command -v kimi
+kimi --version
+kimi acp --help
+```
+
+如果握手成功但返回 `(no response)`，先用 provider 自己的非交互命令检查登录和额度。例如：
+
+```bash
+kimi -p '只回复 OK' --output-format text
+```
+
+MultiNexus 不会把 provider 的 raw stderr、启动参数或私有 thought 转发到 Discord；因此
+provider 额度/认证错误应先在 provider CLI 中诊断。
+
+> 以上 Qoder、Grok Build 与通用 ACP v1 均不在 `python -m multinexus.setup` 的 Standalone
+> 向导选项内；手工配置后统一运行 `python -m multinexus.setup --check` 做只读检查。
+
 ### 本地 LLM (LM Studio)
 
 1. 下载 [LM Studio](https://lmstudio.ai/)
