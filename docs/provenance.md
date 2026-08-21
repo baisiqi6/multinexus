@@ -1,8 +1,8 @@
 # 项目来源与维护说明
 
-本项目基于 GitHub 上的 `baisiqi6/discord-nexus` 继续维护。
+MultiNexus 的历史 lineage 来自 GitHub 上现已归档、停止维护的 `baisiqi6/discord-nexus` fork。本仓库是受支持的公开稳定版本与社区入口。
 
-原始仓库：
+已归档的前身仓库（仅供历史追溯）：
 https://github.com/baisiqi6/discord-nexus
 
 上游源头：
