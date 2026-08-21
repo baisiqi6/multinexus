@@ -1,6 +1,6 @@
 # MultiNexus
 
-> 本仓库基于 [`baisiqi6/discord-nexus`](https://github.com/baisiqi6/discord-nexus) 继续维护。原项目 README 标注为 MIT License，但没有独立 LICENSE 文件。来源与维护说明见 [docs/provenance.md](docs/provenance.md)。
+> 本仓库是 MultiNexus 受支持的公开稳定版本与社区入口。已停止维护的 [`baisiqi6/discord-nexus`](https://github.com/baisiqi6/discord-nexus) 只作为历史 lineage 保留；来源与授权说明见 [docs/provenance.md](docs/provenance.md)。
 
 MultiNexus 是一个 agent 执行织物，用于将可替换的托管和外部 agent 运行时 — 包括 Claude Code、Codex、Qoder、Grok Build、OpenCode、Hermes、OMP 和支持 ACP v1 的 agent — 连接到持久的项目工作。
 
