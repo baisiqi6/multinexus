@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from multinexus.adapters.base import AdapterResult, OUTCOME_FAILED, OUTCOME_TIMED_OUT
 from multinexus.adapters.factory import make_adapter
@@ -318,6 +318,65 @@ class TestOmpHealthCheck(unittest.IsolatedAsyncioTestCase):
             result = await adapter.health_check()
 
         self.assertFalse(result["available"])
+
+    async def test_timeout_terminates_owned_process_group(self):
+        proc = FakeProcess(returncode=None)
+
+        async def hanging_communicate(_input=None):
+            raise asyncio.TimeoutError
+
+        proc.communicate = hanging_communicate
+        cleanup = AsyncMock()
+        process_kwargs = {"start_new_session": True}
+        adapter = OmpAdapter(_make_config(omp_bin="omp"))
+        with (
+            patch(
+                "multinexus.adapters.omp.async_subprocess_kwargs",
+                return_value=process_kwargs,
+            ),
+            patch(
+                "multinexus.adapters.omp.asyncio.create_subprocess_exec",
+                return_value=proc,
+            ) as spawn,
+            patch(
+                "multinexus.adapters.omp.terminate_owned_process_group",
+                cleanup,
+            ),
+        ):
+            result = await adapter.health_check()
+
+        self.assertFalse(result["available"])
+        self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+        cleanup.assert_awaited_once_with(proc)
+
+    async def test_cancellation_terminates_owned_process_group(self):
+        proc = FakeProcess(returncode=None)
+        started = asyncio.Event()
+
+        async def hanging_communicate(_input=None):
+            started.set()
+            await asyncio.sleep(100)
+
+        proc.communicate = hanging_communicate
+        cleanup = AsyncMock()
+        adapter = OmpAdapter(_make_config(omp_bin="omp"))
+        with (
+            patch(
+                "multinexus.adapters.omp.asyncio.create_subprocess_exec",
+                return_value=proc,
+            ),
+            patch(
+                "multinexus.adapters.omp.terminate_owned_process_group",
+                cleanup,
+            ),
+        ):
+            task = asyncio.create_task(adapter.health_check())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        cleanup.assert_awaited_once_with(proc)
 
 
 class TestOmpFactory(unittest.TestCase):
