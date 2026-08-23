@@ -134,6 +134,29 @@ class TestAgentDaemonServer(unittest.TestCase):
         self.assertEqual(len(resp.handoff_lines), 1)
         self.assertIn("[handoff]", resp.handoff_lines[0])
 
+    def test_process_request_defers_text_target_diagnostic(self):
+        """The platform resolves text targets before deciding malformed."""
+        self.fake.set_response(
+            "task",
+            "[handoff] @KnownAgent review this",
+        )
+
+        req = AgentRequest(
+            request_id="r3-text-target",
+            agent_id="test-agent",
+            prompt="task",
+        )
+
+        loop = asyncio.new_event_loop()
+        try:
+            resp = loop.run_until_complete(self.daemon._process_request(req))
+        finally:
+            loop.close()
+
+        self.assertEqual(resp.handoff_lines, [])
+        self.assertEqual(resp.text, "[handoff] @KnownAgent review this")
+        self.assertNotIn("handoff 未发送", resp.text)
+
     def test_process_request_with_report_lines(self):
         """Response with agent-report lines should be split."""
         self.fake.set_response(

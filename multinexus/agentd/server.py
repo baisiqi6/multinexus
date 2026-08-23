@@ -130,7 +130,14 @@ class AgentDaemon:
 
         # Split handoff and report lines from response
         report_lines, response_without_reports = split_agent_report_lines(result.text)
-        handoff_lines, display_text = split_handoff_lines(response_without_reports)
+        # Agentd has no MentionRouter, so a textual target may still become a
+        # valid platform mention later. Defer malformed diagnostics to the
+        # presentation layer, after alias resolution, to avoid false or
+        # duplicate diagnostics.
+        handoff_lines, display_text = split_handoff_lines(
+            response_without_reports,
+            emit_diagnostic=False,
+        )
 
         outcome = result.effective_outcome()
         is_error = outcome != OUTCOME_SUCCESS

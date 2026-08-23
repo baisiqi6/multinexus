@@ -926,8 +926,17 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         else:
             display_text = self._extract_completed_display_text(completed)
 
-        display_text = self.mention_router.resolve_handoff_mentions(display_text)
-        await self._send_text_chunks(channel, placeholder, display_text, [], [])
+        resolved_response_text = self.mention_router.resolve_handoff_mentions(
+            display_text
+        )
+        handoff_lines, display_text = split_handoff_lines(resolved_response_text)
+        await self._send_text_chunks(
+            channel,
+            placeholder,
+            display_text,
+            handoff_lines,
+            [],
+        )
 
         if completed and completed.get("status") == "done":
             self.context_store.record_message(
@@ -936,7 +945,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
                 author_id=str(self.user.id),
                 author_name=self.agent_config.display_name or self.agent_config.id,
                 author_is_bot=True,
-                content=display_text[:2000],
+                content=resolved_response_text[:2000],
                 created_at_ms=int(time.time() * 1000),
                 source="discord",
                 ttl_seconds=self.agent_config.context_ttl_seconds,
