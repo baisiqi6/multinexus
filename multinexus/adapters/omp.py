@@ -1,9 +1,12 @@
 import asyncio
+import logging
 import shutil
 
 from ..models import AgentConfig
 from .base import AdapterResult, AgentAdapter, failed_result, timed_out_result
-from .utils import NO_WINDOW, async_subprocess_kwargs, filtered_env, terminate_owned_process_group
+from .utils import async_subprocess_kwargs, filtered_env, terminate_owned_process_group
+
+log = logging.getLogger(__name__)
 
 
 class OmpAdapter(AgentAdapter):
@@ -139,17 +142,30 @@ class OmpAdapter(AgentAdapter):
 
     async def health_check(self) -> dict:
         bin_path = self.config.omp_bin
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 bin_path, "--version",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=filtered_env(),
-                **NO_WINDOW,
+                **async_subprocess_kwargs(),
             )
             await asyncio.wait_for(proc.communicate(), timeout=10)
             available = proc.returncode == 0
+        except asyncio.CancelledError:
+            if proc is not None and proc.returncode is None:
+                await terminate_owned_process_group(proc)
+            raise
         except Exception:
+            if proc is not None and proc.returncode is None:
+                try:
+                    await terminate_owned_process_group(proc)
+                except Exception as cleanup_error:
+                    log.warning(
+                        "omp health-check cleanup failed: %s",
+                        type(cleanup_error).__name__,
+                    )
             available = False
 
         found = shutil.which(bin_path)

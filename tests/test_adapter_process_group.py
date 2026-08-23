@@ -286,6 +286,22 @@ class TerminateProcessGroupTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self._cleanup_leaks()
 
+    async def test_signal_permission_denial_fails_as_survivor_error(self):
+        proc = _FakeWindowsProcess(pid=4242)
+
+        def denied_signal(_pgid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                raise PermissionError("denied")
+
+        with (
+            patch.object(utils, "IS_WIN", False),
+            patch.object(utils.os, "killpg", side_effect=denied_signal),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "survived SIGKILL"):
+                await utils.terminate_owned_process_group(
+                    proc, terminate_timeout=0, kill_timeout=0
+                )
+
     @_NEEDS_POSIX
     async def test_cancellation_sigkill_cleanup_and_propagate(self):
         """Cancel during termination → SIGKILL cleanup → CancelledError."""

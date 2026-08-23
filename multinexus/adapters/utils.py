@@ -6,7 +6,6 @@ import sys
 from typing import Any
 
 IS_WIN = sys.platform == "win32"
-NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
 
 
 def async_subprocess_kwargs() -> dict[str, Any]:
@@ -107,7 +106,7 @@ async def terminate_owned_process_group(
         # Phase 1: graceful termination of the whole group.
         try:
             os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         gone = await _wait_group_gone(terminate_timeout)
 
@@ -115,7 +114,7 @@ async def terminate_owned_process_group(
         if not gone:
             try:
                 os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             if not await _wait_group_gone(kill_timeout):
                 raise RuntimeError(f"process group {pgid} survived SIGKILL")
