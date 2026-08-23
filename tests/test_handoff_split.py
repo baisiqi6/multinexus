@@ -75,13 +75,61 @@ class TestSplitHandoffLines(unittest.TestCase):
         response = "[handoff] @AgentName 任务描述"
         handoffs, text = split_handoff_lines(response)
         self.assertEqual(handoffs, [])
-        self.assertEqual(text, "[handoff] @AgentName 任务描述")
+        self.assertIn(response, text)
+        self.assertIn("handoff 未发送", text)
 
     def test_missing_space_after_handoff_is_not_split(self):
         response = "[handoff]<@123> 任务描述"
         handoffs, text = split_handoff_lines(response)
         self.assertEqual(handoffs, [])
-        self.assertEqual(text, "[handoff]<@123> 任务描述")
+        self.assertIn(response, text)
+        self.assertIn("handoff 未发送", text)
+
+    def test_multiple_malformed_candidates_emit_one_diagnostic(self):
+        response = (
+            "[handoff] @Unknown first\n"
+            "[handoff]<@123> second"
+        )
+        handoffs, text = split_handoff_lines(response)
+        self.assertEqual(handoffs, [])
+        self.assertIn("[handoff] @Unknown first", text)
+        self.assertIn("[handoff]<@123> second", text)
+        self.assertEqual(text.count("handoff 未发送"), 1)
+
+    def test_mixed_valid_and_malformed_candidates(self):
+        response = (
+            "[handoff] <@123> valid\n"
+            "[handoff] @Unknown malformed"
+        )
+        handoffs, text = split_handoff_lines(response)
+        self.assertEqual(handoffs, ["[handoff] <@123> valid"])
+        self.assertNotIn("[handoff] <@123> valid", text)
+        self.assertIn("[handoff] @Unknown malformed", text)
+        self.assertIn("handoff 未发送", text)
+
+    def test_markdown_wrapped_handoff_example_is_plain_text(self):
+        response = "> [handoff] @AgentName 任务描述"
+        handoffs, text = split_handoff_lines(response)
+        self.assertEqual(handoffs, [])
+        self.assertEqual(text, response)
+
+    def test_repeated_valid_candidates_preserve_existing_behavior(self):
+        response = (
+            "[handoff] <@123> same\n"
+            "[handoff] <@123> same"
+        )
+        handoffs, text = split_handoff_lines(response)
+        self.assertEqual(
+            handoffs,
+            ["[handoff] <@123> same", "[handoff] <@123> same"],
+        )
+        self.assertEqual(text, "")
+
+    def test_diagnostic_can_be_deferred_until_alias_resolution(self):
+        response = "[handoff] @KnownAgent 任务描述"
+        handoffs, text = split_handoff_lines(response, emit_diagnostic=False)
+        self.assertEqual(handoffs, [])
+        self.assertEqual(text, response)
 
 
 if __name__ == "__main__":
