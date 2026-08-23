@@ -17,7 +17,15 @@ import logging
 import time
 from typing import Any
 
-from ..adapters.base import AdapterResult
+from ..adapters.base import (
+    OUTCOME_FAILED,
+    OUTCOME_SUCCESS,
+    OUTCOME_TIMED_OUT,
+    NO_RESPONSE_SENTINEL,
+    AdapterResult,
+    is_error_text,
+    safe_exception_diagnostic,
+)
 from ..adapters.factory import make_adapter
 from ..models import AgentConfig
 from ..sessions.store import SessionStore
@@ -505,7 +513,16 @@ class AgentdWorker:
                     await renewal_task
                 except asyncio.CancelledError:
                     pass
-            result = AdapterResult(text=f"Agent error: {exc}")
+            # Orchestration boundary: an unexpected exception settles the
+            # durable job as an explicit internal_error with a bounded
+            # diagnostic. The safe text never leaks the raw exception.
+            log.exception("Provider invocation failed for job %s", trusted_job_id)
+            result = AdapterResult(
+                text="Agent error: internal adapter failure",
+                outcome=OUTCOME_FAILED,
+                error_category="internal_error",
+                diagnostic=safe_exception_diagnostic(exc),
+            )
 
         if progress_tasks:
             await asyncio.gather(*progress_tasks, return_exceptions=True)
@@ -521,15 +538,35 @@ class AgentdWorker:
                 work_dir=work_dir,
             )
 
+        outcome = result.effective_outcome()
         status = self._status_for_result(result)
+        # Delivery decision reads the machine outcome; the legacy sentinel is
+        # honored only for results that still carry no structured category.
+        no_response = (
+            outcome == OUTCOME_FAILED
+            and result.error_category == "no_response"
+        ) or (
+            result.error_category is None
+            and result.text.strip() == NO_RESPONSE_SENTINEL
+        )
         result_json = {
-            "response_text": result.text,
+            # Coordinate creates a response delivery for any non-empty
+            # response_text, including failed jobs.  Preserve the diagnostic
+            # sentinel separately, but do not publish it as a user reply.
+            "response_text": "" if no_response else result.text,
             "session_id": result.session_id or "",
             "duration_ms": duration_ms,
             "execution_context_id": ctx.context_id,
             "worktree_path": ctx.worktree_path,
             "session_scope_id": ctx.session_scope_id,
+            "outcome": outcome,
         }
+        if no_response:
+            result_json["error"] = NO_RESPONSE_SENTINEL
+        if result.error_category is not None:
+            result_json["error_category"] = result.error_category
+        if result.diagnostic:
+            result_json["diagnostic"] = result.diagnostic
         if binding is not None:
             result_json.update(binding.result_evidence())
         if progress_state:
@@ -834,21 +871,35 @@ class AgentdWorker:
                 work_dir=work_dir,
                 on_progress=on_progress,
             )
-            if self._is_error(result.text):
+            if result.effective_outcome() != OUTCOME_SUCCESS:
+                allow_fresh_fallback = getattr(
+                    self.adapter,
+                    "allow_fresh_fallback_after_resume_error",
+                    True,
+                )
+                is_internal_error = (
+                    getattr(result, "error_category", None) == "internal_error"
+                )
                 log.warning(
-                    "Resume failed for %s, falling back to fresh call",
+                    "Resume failed for %s (fresh fallback allowed=%s)",
                     existing["session_id"],
+                    allow_fresh_fallback,
                 )
                 self.session_store.mark_stale(
                     scope_id=existing["scope_id"],
                     agent_id=self.config.id,
                 )
-                result = await self.adapter.call(
-                    prompt,
-                    timeout=self.config.timeout,
-                    work_dir=work_dir,
-                    on_progress=on_progress,
-                )
+                if allow_fresh_fallback and not is_internal_error:
+                    result = await self.adapter.call(
+                        prompt,
+                        timeout=self.config.timeout,
+                        work_dir=work_dir,
+                        on_progress=on_progress,
+                    )
+                else:
+                    # The provider session was just made stale.  Do not let the
+                    # generic result persistence below reactivate the dead row.
+                    result.session_id = None
             return result
 
         return await self.adapter.call(
@@ -874,7 +925,9 @@ class AgentdWorker:
             work_dir=work_dir,
             on_progress=on_progress,
         )
-        if self._is_error(result.text):
+        if result.effective_outcome() != OUTCOME_SUCCESS:
+            # Fail closed without a fresh duplicate; preserve the failure
+            # category so the durable job record stays honest.
             return AdapterResult(
                 text=(
                     "Agent error: recoverable session resume failed; "
@@ -882,6 +935,13 @@ class AgentdWorker:
                 ),
                 session_id=session_id,
                 resumed=True,
+                outcome=OUTCOME_FAILED,
+                error_category=(
+                    result.error_category
+                    if result.error_category is not None
+                    else "provider_error"
+                ),
+                diagnostic=result.diagnostic,
             )
         return result
 
@@ -889,32 +949,26 @@ class AgentdWorker:
         self._running = False
         self._wake.set()
 
-    _ERROR_PREFIXES = (
-        "Agent error:",
-        "OpenCode CLI failed",
-        "OpenCode timed out",
-        "OpenCode returned no text",
-        "Codex CLI failed",
-        "Codex timed out",
-        "Codex stopped responding",
-        "Codex resume failed",
-        "Hermes CLI failed",
-        "Hermes timed out",
-        "Claude CLI failed",
-        "Claude error:",
-        "Claude timeout",
-        "omp CLI failed",
-        "omp timed out",
-    )
-
     @classmethod
     def _is_error(cls, text: str) -> bool:
-        return any(text.startswith(p) for p in cls._ERROR_PREFIXES)
+        # Legacy/external compatibility seam for plain-text inputs only.
+        # AdapterResult consumers must read effective_outcome() instead.
+        return is_error_text(text)
 
     @classmethod
     def _status_for_result(cls, result: AdapterResult) -> str:
-        if result.metadata.get("timeout"):
+        effective = getattr(result, "effective_outcome", None)
+        if not callable(effective):
+            # Legacy duck-typed result (external/third-party/test double):
+            # normalize through the single core seam, never a second classifier.
+            effective = AdapterResult(
+                text=result.text,
+                metadata=getattr(result, "metadata", None) or {},
+            ).effective_outcome()
+        else:
+            effective = effective()
+        if effective == OUTCOME_TIMED_OUT:
             return "timed_out"
-        if result.text.startswith("Claude timeout:"):
-            return "timed_out"
-        return "done" if not cls._is_error(result.text) else "failed"
+        if effective == OUTCOME_FAILED:
+            return "failed"
+        return "done"

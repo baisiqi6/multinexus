@@ -3,7 +3,7 @@ import logging
 import unittest
 from unittest.mock import patch
 
-from multinexus.adapters.base import AdapterResult
+from multinexus.adapters.base import AdapterResult, OUTCOME_FAILED, OUTCOME_TIMED_OUT
 from multinexus.adapters.hermes import HermesAdapter
 from multinexus.models import AgentConfig
 
@@ -76,6 +76,8 @@ class TestHermesSuccess(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(result, AdapterResult)
         self.assertEqual(result.text, "(no response)")
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "no_response")
 
 
 class TestHermesFailure(unittest.IsolatedAsyncioTestCase):
@@ -89,6 +91,8 @@ class TestHermesFailure(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Hermes CLI failed (2)", result.text)
         self.assertIn("config error", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "process_error")
 
     async def test_nonzero_exit_falls_back_to_stdout(self):
         async def fake_exec(*args, **kwargs):
@@ -114,6 +118,8 @@ class TestHermesMissingCLI(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Hermes CLI not found", result.text)
         self.assertIn("/no/such/hermes", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "unavailable")
 
 
 class TestHermesTimeout(unittest.IsolatedAsyncioTestCase):
@@ -149,6 +155,8 @@ class TestHermesTimeout(unittest.IsolatedAsyncioTestCase):
         self.assertIn("timed out after 5s", result.text)
         self.assertTrue(proc.killed)
         self.assertEqual(cleanup_calls, [proc])
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
 
     async def test_cancellation_kills_process(self):
         proc = FakeProcess()

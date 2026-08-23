@@ -11,7 +11,14 @@ import logging
 import time
 from aiohttp import web
 
-from ..adapters.base import AdapterResult
+from ..adapters.base import (
+    OUTCOME_FAILED,
+    OUTCOME_SUCCESS,
+    OUTCOME_TIMED_OUT,
+    AdapterResult,
+    is_error_text,
+    safe_exception_diagnostic,
+)
 from ..adapters.factory import make_adapter
 from ..handoff import split_handoff_lines
 from ..handoff_handler import (
@@ -107,8 +114,17 @@ class AgentDaemon:
             try:
                 result = await self._run_adapter(req, progress_state=progress_state)
             except Exception as exc:
+                # Orchestration boundary: an unexpected exception settles the
+                # request as an explicit internal_error with a bounded
+                # diagnostic. The user-visible text is a safe summary and never
+                # leaks the raw exception.
                 log.exception("Adapter failed for request %s", req.request_id)
-                result = AdapterResult(text=f"Agent error: {exc}")
+                result = AdapterResult(
+                    text="Agent error: internal adapter failure",
+                    outcome=OUTCOME_FAILED,
+                    error_category="internal_error",
+                    diagnostic=safe_exception_diagnostic(exc),
+                )
 
         duration_ms = int((time.time() - start) * 1000)
 
@@ -116,19 +132,31 @@ class AgentDaemon:
         report_lines, response_without_reports = split_agent_report_lines(result.text)
         handoff_lines, display_text = split_handoff_lines(response_without_reports)
 
+        outcome = result.effective_outcome()
+        is_error = outcome != OUTCOME_SUCCESS
+        # Project the machine settlement and bounded diagnostic onto the
+        # envelope. diagnostic stays out of text/error so it can never become
+        # an ordinary platform reply.
+        response_metadata = dict(result.metadata)
+        response_metadata["outcome"] = outcome
+        if result.error_category is not None:
+            response_metadata["error_category"] = result.error_category
+        if result.diagnostic:
+            response_metadata["diagnostic"] = result.diagnostic
+
         return AgentResponse(
             request_id=req.request_id,
             agent_id=self.config.id,
             text=display_text,
             session_id=result.session_id or "",
             resumed=result.resumed,
-            success=not self._is_error(result.text),
-            error="" if not self._is_error(result.text) else result.text,
+            success=not is_error,
+            error="" if not is_error else result.text,
             handoff_lines=handoff_lines,
             report_lines=report_lines,
             duration_ms=duration_ms,
             destination=req.destination,
-            metadata=result.metadata,
+            metadata=response_metadata,
         )
 
     async def _run_adapter(
@@ -194,22 +222,39 @@ class AgentDaemon:
                     ),
                     timeout=timeout,
                 )
-                if self._is_error(result.text):
-                    log.warning("Resume failed for %s, falling back to fresh call", existing["session_id"])
+                if result.effective_outcome() != OUTCOME_SUCCESS:
+                    allow_fresh_fallback = getattr(
+                        self.adapter,
+                        "allow_fresh_fallback_after_resume_error",
+                        True,
+                    )
+                    is_internal_error = (
+                        getattr(result, "error_category", None) == "internal_error"
+                    )
+                    log.warning(
+                        "Resume failed for %s (fresh fallback allowed=%s)",
+                        existing["session_id"],
+                        allow_fresh_fallback,
+                    )
                     self.session_store.mark_stale(
                         scope_id=existing["scope_id"],
                         agent_id=self.config.id,
                     )
                     existing = None
-                    progress_state["partial"] = ""
-                    result = await asyncio.wait_for(
-                        self.adapter.call(
-                            prompt,
-                            work_dir=work_dir,
-                            on_progress=progress_cb,
-                        ),
-                        timeout=timeout,
-                    )
+                    if allow_fresh_fallback and not is_internal_error:
+                        progress_state["partial"] = ""
+                        result = await asyncio.wait_for(
+                            self.adapter.call(
+                                prompt,
+                                work_dir=work_dir,
+                                on_progress=progress_cb,
+                            ),
+                            timeout=timeout,
+                        )
+                    else:
+                        # Provider session was just made stale; do not let the
+                        # generic persistence below reactivate the dead row.
+                        result.session_id = None
             else:
                 result = await asyncio.wait_for(
                     self.adapter.call(
@@ -220,7 +265,12 @@ class AgentDaemon:
                     timeout=timeout,
                 )
         except asyncio.TimeoutError:
-            result = AdapterResult(text=f"Agent error: timed out after {timeout}s")
+            # Expected operational failure: settle explicitly so the terminal
+            # state no longer depends on the user-visible text.
+            result = AdapterResult(
+                text=f"Agent error: timed out after {timeout}s",
+                outcome=OUTCOME_TIMED_OUT,
+            )
 
         # Persist session
         if result.session_id:
@@ -250,15 +300,8 @@ class AgentDaemon:
             progress_state["partial"] = partial_text
         return _on_progress
 
-    _ERROR_PREFIXES = (
-        "Agent error:",
-        "OpenCode CLI failed", "OpenCode timed out",
-        "Codex CLI failed", "Codex timed out", "Codex stopped responding", "Codex resume failed",
-        "Hermes CLI failed", "Hermes timed out",
-        "Claude CLI failed", "Claude error:", "Claude timeout",
-        "omp CLI failed", "omp timed out",
-    )
-
     @classmethod
     def _is_error(cls, text: str) -> bool:
-        return any(text.startswith(p) for p in cls._ERROR_PREFIXES)
+        # Legacy/external compatibility seam for plain-text inputs only.
+        # AdapterResult consumers must read effective_outcome() instead.
+        return is_error_text(text)

@@ -2,7 +2,7 @@ import asyncio
 import shutil
 
 from ..models import AgentConfig
-from .base import AdapterResult, AgentAdapter
+from .base import AdapterResult, AgentAdapter, failed_result, timed_out_result
 from .utils import NO_WINDOW, async_subprocess_kwargs, filtered_env, terminate_owned_process_group
 
 
@@ -89,7 +89,10 @@ class OmpAdapter(AgentAdapter):
                 **async_subprocess_kwargs(),
             )
         except FileNotFoundError:
-            return AdapterResult(text=f"omp CLI not found: {self.config.omp_bin}")
+            return failed_result(
+                text=f"omp CLI not found: {self.config.omp_bin}",
+                category="unavailable",
+            )
 
         cleanup_attempted = False
 
@@ -106,7 +109,7 @@ class OmpAdapter(AgentAdapter):
             )
         except asyncio.TimeoutError:
             await cleanup()
-            return AdapterResult(text=f"omp timed out after {timeout}s")
+            return timed_out_result(text=f"omp timed out after {timeout}s")
         except asyncio.CancelledError:
             await cleanup()
             raise
@@ -120,14 +123,19 @@ class OmpAdapter(AgentAdapter):
         if proc.returncode != 0:
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             detail = stderr_text or f"exit code {proc.returncode}"
-            return AdapterResult(
-                text=f"omp CLI failed ({proc.returncode}): {detail[:500]}"
+            return failed_result(
+                text=f"omp CLI failed ({proc.returncode}): {detail[:500]}",
+                category="process_error",
             )
 
-        return AdapterResult(
-            text=response_text or "(no response)",
-            session_id=session_id,
-        )
+        if not response_text:
+            return failed_result(
+                text="(no response)",
+                category="no_response",
+                session_id=session_id,
+            )
+
+        return AdapterResult(text=response_text, session_id=session_id)
 
     async def health_check(self) -> dict:
         bin_path = self.config.omp_bin

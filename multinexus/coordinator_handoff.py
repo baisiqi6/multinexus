@@ -7,6 +7,7 @@ import time
 
 import discord
 
+from .adapters.base import OUTCOMES, OUTCOME_SUCCESS
 from .handoff import split_handoff_lines
 from .handoff_handler import (
     build_handoff_prompt,
@@ -261,7 +262,7 @@ class CoordinatorHandoffMixin:
                 progress_state=progress_state,
             )
             response_text = result.text
-            is_error = self._is_error_response(result.text)
+            is_error = result.effective_outcome() != OUTCOME_SUCCESS
 
         # Send response
         response_text = self.mention_router.resolve_handoff_mentions(response_text)
@@ -436,7 +437,7 @@ class CoordinatorHandoffMixin:
                 progress_state=progress_state,
             )
             response_text = result.text
-            is_error = self._is_error_response(result.text)
+            is_error = result.effective_outcome() != OUTCOME_SUCCESS
 
         response_text = self.mention_router.resolve_handoff_mentions(response_text)
         report_lines, response_without_reports = client_facade.split_agent_report_lines(
@@ -572,7 +573,23 @@ class CoordinatorHandoffMixin:
             return "Agent timed out (no response from agentd).", True
 
         display_text = self._extract_completed_display_text(completed)
-        is_error = completed.get("status") != "done" or self._is_error_response(display_text)
+        if completed.get("status") != "done":
+            # Coordinate job status is terminal authority: any non-done status
+            # is an error regardless of a structured outcome projection.
+            is_error = True
+        else:
+            result_data = completed.get("result")
+            structured_outcome = (
+                result_data.get("outcome") if isinstance(result_data, dict) else None
+            )
+            if isinstance(structured_outcome, str) and structured_outcome in OUTCOMES:
+                # Structured projection from agentd: machine settlement wins
+                # over any text the provider happened to produce.
+                is_error = structured_outcome != OUTCOME_SUCCESS
+            else:
+                # External/legacy boundary: no AdapterResult in scope here,
+                # only Coordinate job status plus the shared text seam.
+                is_error = self._is_error_response(display_text)
         return display_text, is_error
 
     async def _send_missing_report_fallback(

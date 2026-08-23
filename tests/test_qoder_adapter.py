@@ -9,6 +9,7 @@ from multinexus.adapters.factory import make_adapter
 from multinexus.adapters.qoder import QoderAdapter
 from multinexus.config import _load_toml_agent
 from multinexus.models import AgentConfig
+from multinexus.adapters.base import OUTCOME_FAILED, OUTCOME_TIMED_OUT
 
 
 def _config(**overrides):
@@ -180,6 +181,8 @@ class QoderCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.resumed)
         self.assertEqual(result.text, "Qoder resume failed: session mismatch")
         self.assertEqual(result.session_id, "q-old")
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "protocol_error")
 
     async def test_unrecognized_fields_are_not_forwarded(self):
         secret = "PRIVATE-THOUGHT-SENTINEL"
@@ -200,19 +203,27 @@ class QoderCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, repr(result.metadata))
         self.assertNotIn(secret, repr(progress))
 
-    async def test_empty_invalid_and_provider_error(self):
         cases = [
-            (_FakeProcess(_success(result="  ")), "(no response)"),
+            (
+                _FakeProcess(_success(result="  ")),
+                "(no response)",
+                OUTCOME_FAILED,
+                "no_response",
+            ),
             (
                 _FakeProcess(stdout=b"not-json"),
                 "Qoder error: invalid JSON response",
+                OUTCOME_FAILED,
+                "protocol_error",
             ),
             (
                 _FakeProcess(_success(is_error=True)),
                 "Qoder error: provider returned an error",
+                OUTCOME_FAILED,
+                "provider_error",
             ),
         ]
-        for proc, expected in cases:
+        for proc, expected_text, expected_outcome, expected_category in cases:
             async def fake_create(*args, _proc=proc, **kwargs):
                 return _proc
 
@@ -221,7 +232,9 @@ class QoderCallTests(unittest.IsolatedAsyncioTestCase):
                 new=fake_create,
             ):
                 result = await QoderAdapter(_config()).call("ping")
-            self.assertEqual(result.text, expected)
+            self.assertEqual(result.text, expected_text)
+            self.assertEqual(result.outcome, expected_outcome)
+            self.assertEqual(result.error_category, expected_category)
 
     async def test_nonzero_and_missing_binary_are_stable(self):
         proc = _FakeProcess(stdout=b"secret diagnostic", returncode=7)
@@ -236,6 +249,8 @@ class QoderCallTests(unittest.IsolatedAsyncioTestCase):
             result = await QoderAdapter(_config()).call("ping")
         self.assertEqual(result.text, "Qoder CLI failed (7)")
         self.assertNotIn("secret", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "process_error")
 
         async def missing(*args, **kwargs):
             raise FileNotFoundError
@@ -248,6 +263,8 @@ class QoderCallTests(unittest.IsolatedAsyncioTestCase):
                 "ping"
             )
         self.assertEqual(result.text, "Qoder CLI not found: /missing/qoder")
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "unavailable")
 
 
 class QoderLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -275,6 +292,8 @@ class QoderLifecycleTests(unittest.IsolatedAsyncioTestCase):
             result = await QoderAdapter(_config(timeout=0.01)).call("ping")
         self.assertIn("timeout", result.text.lower())
         self.assertEqual(cleanup_calls, [proc])
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
 
     async def test_cancellation_cleans_process_group_once(self):
         proc = _FakeProcess(hang=True)

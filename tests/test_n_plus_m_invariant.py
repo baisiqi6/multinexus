@@ -127,6 +127,64 @@ class TestBridgeModeDoesNotInstantiateAdapter(unittest.TestCase):
         self.assertFalse(hasattr(client, "_stop_agentd"))
         self.assertFalse(hasattr(client, "_agentd_client"))
 
+    def test_discord_legacy_strict_resume_does_not_fall_back_or_reactivate(self):
+        """The adapter resume policy is consistent in legacy direct mode."""
+        from multinexus.adapters.base import AdapterResult
+        from multinexus.client import DiscordClient
+        from multinexus.sessions.store import SessionStore
+
+        cfg = _config(agentd_mode=False, adapter="claude")
+        client = DiscordClient.__new__(DiscordClient)
+        client.agent_config = cfg
+        client.session_store = SessionStore(cfg.context_db_path)
+
+        class StrictAdapter:
+            allow_fresh_fallback_after_resume_error = False
+
+            def __init__(self):
+                self.calls = []
+                self.resumes = []
+
+            async def call(self, prompt, **kwargs):
+                self.calls.append(prompt)
+                return AdapterResult(text="fresh duplicate", session_id="sess_new")
+
+            async def resume(self, session_id, prompt, **kwargs):
+                self.resumes.append((session_id, prompt))
+                return AdapterResult(
+                    text="Codex resume failed: session mismatch",
+                    session_id=session_id,
+                )
+
+        client.adapter = StrictAdapter()
+        client.session_store.upsert(
+            scope_id="channel:legacy-strict",
+            agent_id=cfg.id,
+            adapter="claude",
+            session_id="sess_dead",
+            work_dir=cfg.work_dir,
+        )
+
+        result = asyncio.run(
+            client._run_adapter_for_scope(
+                "continue",
+                session_scope_id="channel:legacy-strict",
+                legacy_scope_ids=(),
+                placeholder=None,
+                progress_state={},
+            )
+        )
+
+        self.assertEqual(result.text, "Codex resume failed: session mismatch")
+        self.assertIsNone(result.session_id)
+        self.assertEqual(client.adapter.resumes, [("sess_dead", "continue")])
+        self.assertEqual(client.adapter.calls, [])
+        self.assertIsNone(
+            client.session_store.get_first_active(
+                scope_ids=("channel:legacy-strict",), agent_id=cfg.id
+            )
+        )
+
 
 class TestKookBridgeImportBehavior(unittest.TestCase):
     """Verify KOOK bridge import behavior when khl is absent."""
@@ -1359,6 +1417,229 @@ class TestRequirementsKhlDistributionContract(unittest.TestCase):
             normalized_lines,
             "requirements.txt must declare exact KOOK SDK `khl.py==0.3.17`",
         )
+
+
+class TestWorkerOutcomeContract(unittest.TestCase):
+    """R2: AgentdWorker status/delivery decisions read effective_outcome()."""
+
+    def _worker_with(self, call_fn):
+        from multinexus.agentd.worker import AgentdWorker
+
+        cfg = _config(
+            coordinator_cli_path="/usr/bin/true",
+            coordinator_db_path="/tmp/test.db",
+        )
+        worker = AgentdWorker(cfg)
+        worker.adapter = MagicMock()
+        worker.adapter.call = AsyncMock(side_effect=call_fn)
+        reported = []
+
+        async def mock_report(
+            *, job_id, agent_id, status, result_json, attempt_token=None, lease_id=None
+        ):
+            reported.append({"status": status, "result_json": result_json})
+            return {"result": {}}
+
+        worker.coordinate.report_job = mock_report
+        return worker, reported
+
+    def _process(self, worker, *, prompt="do it", job_id="job-oc"):
+        job = {
+            "id": job_id,
+            "payload_json": json.dumps({"prompt": prompt}),
+        }
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(worker._process_job(_claim_result(job)))
+        finally:
+            loop.close()
+
+    def test_explicit_success_error_like_text_reports_done(self):
+        from multinexus.adapters.base import OUTCOME_SUCCESS, AdapterResult
+
+        async def call(prompt, **kw):
+            return AdapterResult(
+                text="OpenCode CLI failed", outcome=OUTCOME_SUCCESS, session_id="s1"
+            )
+
+        worker, reported = self._worker_with(call)
+        self._process(worker)
+
+        self.assertEqual(reported[0]["status"], "done")
+        body = reported[0]["result_json"]
+        self.assertEqual(body["outcome"], OUTCOME_SUCCESS)
+        self.assertEqual(body["response_text"], "OpenCode CLI failed")
+        self.assertNotIn("error_category", body)
+
+    def test_explicit_failed_plain_text_reports_failed(self):
+        from multinexus.adapters.base import OUTCOME_FAILED, AdapterResult
+
+        async def call(prompt, **kw):
+            return AdapterResult(
+                text="looks fine",
+                outcome=OUTCOME_FAILED,
+                error_category="provider_error",
+            )
+
+        worker, reported = self._worker_with(call)
+        self._process(worker)
+
+        self.assertEqual(reported[0]["status"], "failed")
+        body = reported[0]["result_json"]
+        self.assertEqual(body["outcome"], OUTCOME_FAILED)
+        self.assertEqual(body["error_category"], "provider_error")
+        self.assertEqual(body["response_text"], "looks fine")
+
+    def test_explicit_timed_out_reports_timed_out(self):
+        from multinexus.adapters.base import OUTCOME_TIMED_OUT, AdapterResult
+
+        async def call(prompt, **kw):
+            return AdapterResult(text="fine", outcome=OUTCOME_TIMED_OUT)
+
+        worker, reported = self._worker_with(call)
+        self._process(worker)
+
+        self.assertEqual(reported[0]["status"], "timed_out")
+        body = reported[0]["result_json"]
+        self.assertEqual(body["outcome"], OUTCOME_TIMED_OUT)
+        self.assertEqual(body["error_category"], "timeout")
+
+    def test_structured_no_response_is_not_delivered(self):
+        from multinexus.adapters.base import OUTCOME_FAILED, AdapterResult
+
+        async def call(prompt, **kw):
+            return AdapterResult(
+                text="(no response)",
+                outcome=OUTCOME_FAILED,
+                error_category="no_response",
+            )
+
+        worker, reported = self._worker_with(call)
+        self._process(worker)
+
+        self.assertEqual(reported[0]["status"], "failed")
+        body = reported[0]["result_json"]
+        self.assertEqual(body["response_text"], "")
+        self.assertEqual(body["error"], "(no response)")
+        self.assertEqual(body["error_category"], "no_response")
+
+    def test_internal_exception_settles_internal_error_bounded(self):
+        from multinexus.adapters.base import OUTCOME_FAILED
+
+        async def boom(prompt, **kw):
+            raise RuntimeError("secret " + "x" * 5000)
+
+        worker, reported = self._worker_with(boom)
+        with self.assertLogs("multinexus.agentd.worker", level="ERROR") as cm:
+            self._process(worker)
+
+        self.assertEqual(reported[0]["status"], "failed")
+        body = reported[0]["result_json"]
+        self.assertEqual(body["outcome"], OUTCOME_FAILED)
+        self.assertEqual(body["error_category"], "internal_error")
+        self.assertEqual(body["diagnostic"], "RuntimeError")
+        self.assertNotIn("secret", body["diagnostic"])
+        # Safe text never leaks the raw diagnostic into the delivery payload.
+        self.assertNotIn("secret", body["response_text"])
+        self.assertTrue(any("Provider invocation failed" in record.getMessage() for record in cm.records))
+
+    def test_cancelled_error_propagates_without_report(self):
+        async def cancel(prompt, **kw):
+            raise asyncio.CancelledError()
+
+        worker, reported = self._worker_with(cancel)
+        job = {"id": "job-c", "payload_json": json.dumps({"prompt": "x"})}
+        loop = asyncio.new_event_loop()
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                loop.run_until_complete(worker._process_job(_claim_result(job)))
+        finally:
+            loop.close()
+        self.assertEqual(reported, [])
+
+    def test_internal_error_resume_does_not_fresh_fallback(self):
+        from multinexus.adapters.base import OUTCOME_FAILED, AdapterResult
+
+        class InternalResume:
+            def __init__(self):
+                self.calls = 0
+                self.resumes = 0
+
+            async def call(self, prompt, **kw):
+                self.calls += 1
+                return AdapterResult(text="fresh", session_id="new")
+
+            async def resume(self, session_id, prompt, **kw):
+                self.resumes += 1
+                return AdapterResult(
+                    text="Agent error: internal adapter failure",
+                    outcome=OUTCOME_FAILED,
+                    error_category="internal_error",
+                    diagnostic="boom",
+                    session_id=session_id,
+                )
+
+        adapter = InternalResume()
+        worker, reported = self._worker_with(adapter.call)
+        worker.adapter = adapter
+        worker.session_store.upsert(
+            scope_id="scope:1",
+            agent_id="test-agent",
+            adapter="claude",
+            session_id="sess-old",
+            work_dir="/tmp/ws",
+        )
+        self._process(worker, prompt="continue")
+
+        self.assertEqual(worker.adapter.resumes, 1)
+        self.assertEqual(worker.adapter.calls, 0)
+        self.assertEqual(reported[0]["status"], "failed")
+        self.assertEqual(
+            reported[0]["result_json"]["error_category"], "internal_error"
+        )
+
+
+class TestDiscordLegacyOutcomeContract(unittest.TestCase):
+    """R2: DiscordClient legacy adapter path reads effective_outcome()."""
+
+    def _legacy_client(self):
+        from multinexus.client import DiscordClient
+        from multinexus.sessions.store import SessionStore
+
+        cfg = _config(agentd_mode=False)
+        client = DiscordClient.__new__(DiscordClient)
+        client.agent_config = cfg
+        client.session_store = SessionStore(cfg.context_db_path)
+        return client
+
+    def test_unexpected_exception_settles_internal_error_bounded(self):
+        """Direct proof the unexpected-exception path constructs internal_error
+        (regression for the missing OUTCOME_FAILED import)."""
+        from multinexus.adapters.base import OUTCOME_FAILED
+
+        class BoomAdapter:
+            async def call(self, prompt, **kwargs):
+                raise RuntimeError("secret " + "x" * 5000)
+
+        client = self._legacy_client()
+        client.adapter = BoomAdapter()
+        result = asyncio.run(
+            client._run_adapter_for_scope(
+                "go",
+                session_scope_id="channel:boom",
+                legacy_scope_ids=(),
+                placeholder=None,
+                progress_state={},
+            )
+        )
+
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "internal_error")
+        self.assertEqual(result.diagnostic, "RuntimeError")
+        self.assertNotIn("secret", result.diagnostic)
+        # Safe text never leaks the raw diagnostic into the reply.
+        self.assertNotIn("secret", result.text)
+
 
 if __name__ == "__main__":
     unittest.main()

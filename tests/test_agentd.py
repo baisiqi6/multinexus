@@ -206,6 +206,46 @@ class TestAgentDaemonServer(unittest.TestCase):
         self.assertEqual(resp.text, "KOOK reply")
         self.assertEqual(resp.destination.platform, Platform.KOOK)
 
+    def test_strict_resume_error_does_not_fall_back_or_reactivate_session(self):
+        """Strict adapter policy also applies to the legacy AgentDaemon path."""
+        from multinexus.adapters.base import AdapterResult
+
+        class StrictResumeAdapter(FakeAdapter):
+            allow_fresh_fallback_after_resume_error = False
+
+            async def resume(self, session_id, prompt, **kwargs):
+                self._call_count += 1
+                return AdapterResult(
+                    text="Codex resume failed: session mismatch",
+                    session_id=session_id,
+                )
+
+        strict = StrictResumeAdapter(self.config)
+        self.daemon.adapter = strict
+        self.daemon.session_store.upsert(
+            scope_id="channel:strict",
+            agent_id=self.config.id,
+            adapter="claude",
+            session_id="sess_dead",
+            work_dir=self.config.work_dir,
+        )
+        req = AgentRequest(
+            request_id="strict-resume",
+            agent_id=self.config.id,
+            prompt="continue",
+            session_scope="channel:strict",
+        )
+
+        result = asyncio.run(self.daemon._run_adapter(req, progress_state={}))
+        self.assertEqual(result.text, "Codex resume failed: session mismatch")
+        self.assertIsNone(result.session_id)
+        self.assertEqual(strict._call_count, 1)
+        self.assertIsNone(
+            self.daemon.session_store.get_first_active(
+                scope_ids=("channel:strict",), agent_id=self.config.id
+            )
+        )
+
 
 class TestAgentDaemonHTTPEndToEnd(unittest.TestCase):
     """Test full HTTP round-trip with fake adapter."""
@@ -492,6 +532,207 @@ class TestReapPolicy(unittest.TestCase):
                     ]
                 )
         load_config.assert_not_called()
+
+
+class TestAgentDaemonOutcomeContract(unittest.TestCase):
+    """R2: AgentDaemon machine settlement reads effective_outcome().
+
+    Text never decides success/error; structured outcomes and the
+    orchestration boundary own the terminal state.
+    """
+
+    def setUp(self):
+        self.config = _make_config()
+        from multinexus.agentd.server import AgentDaemon
+        self.daemon = AgentDaemon(self.config, host="127.0.0.1", port=0)
+        self.fake = FakeAdapter(self.config)
+        self.daemon.adapter = self.fake
+
+    def _process(self, req: AgentRequest) -> AgentResponse:
+        return asyncio.run(self.daemon._process_request(req))
+
+    def _run_adapter(self, req: AgentRequest):
+        return asyncio.run(self.daemon._run_adapter(req, progress_state={}))
+
+    def _set_call(self, fn):
+        """Install an adapter whose call() awaits fn(prompt, **kwargs)."""
+        class DynamicAdapter(FakeAdapter):
+            async def call(self, prompt, **kwargs):
+                return await fn(prompt, **kwargs)
+        self.daemon.adapter = DynamicAdapter(self.config)
+
+    def test_explicit_success_with_error_like_text_is_success(self):
+        from multinexus.adapters.base import OUTCOME_SUCCESS, AdapterResult
+
+        async def call(prompt, **kwargs):
+            return AdapterResult(text="OpenCode CLI failed", outcome=OUTCOME_SUCCESS)
+
+        self._set_call(call)
+        resp = self._process(
+            AgentRequest(request_id="r-s", agent_id="test-agent", prompt="go")
+        )
+
+        self.assertTrue(resp.success)
+        self.assertEqual(resp.error, "")
+        self.assertEqual(resp.metadata["outcome"], OUTCOME_SUCCESS)
+
+    def test_explicit_failed_with_plain_text_is_error(self):
+        from multinexus.adapters.base import OUTCOME_FAILED, AdapterResult
+
+        async def call(prompt, **kwargs):
+            return AdapterResult(
+                text="looks fine",
+                outcome=OUTCOME_FAILED,
+                error_category="provider_error",
+            )
+
+        self._set_call(call)
+        resp = self._process(
+            AgentRequest(request_id="r-f", agent_id="test-agent", prompt="go")
+        )
+
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.error, "looks fine")
+        self.assertEqual(resp.metadata["outcome"], OUTCOME_FAILED)
+        self.assertEqual(resp.metadata["error_category"], "provider_error")
+
+    def test_timed_out_projection(self):
+        from multinexus.adapters.base import OUTCOME_TIMED_OUT, AdapterResult
+
+        async def call(prompt, **kwargs):
+            return AdapterResult(text="no reply", outcome=OUTCOME_TIMED_OUT)
+
+        self._set_call(call)
+        resp = self._process(
+            AgentRequest(request_id="r-t", agent_id="test-agent", prompt="go")
+        )
+
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.metadata["outcome"], OUTCOME_TIMED_OUT)
+        self.assertEqual(resp.metadata["error_category"], "timeout")
+
+    def test_wait_for_timeout_settles_timed_out(self):
+        from multinexus.adapters.base import OUTCOME_TIMED_OUT
+
+        async def slow(prompt, **kwargs):
+            await asyncio.sleep(30)
+
+        self._set_call(slow)
+        result = self._run_adapter(
+            AgentRequest(
+                request_id="r-slow",
+                agent_id="test-agent",
+                prompt="slow",
+                timeout=0.05,
+            )
+        )
+
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
+
+    def test_internal_exception_settles_internal_error_bounded(self):
+        from multinexus.adapters.base import OUTCOME_FAILED
+
+        async def boom(prompt, **kwargs):
+            raise RuntimeError("secret " + "x" * 5000)
+
+        self._set_call(boom)
+        with self.assertLogs("multinexus.agentd.server", level="ERROR") as cm:
+            resp = self._process(
+                AgentRequest(request_id="r-boom", agent_id="test-agent", prompt="go")
+            )
+
+        self.assertFalse(resp.success)
+        self.assertEqual(resp.metadata["outcome"], OUTCOME_FAILED)
+        self.assertEqual(resp.metadata["error_category"], "internal_error")
+        self.assertEqual(resp.metadata["diagnostic"], "RuntimeError")
+        self.assertNotIn("secret", resp.metadata["diagnostic"])
+        # Safe summary must not leak the raw diagnostic into the reply.
+        self.assertNotIn("secret", resp.text)
+        self.assertNotIn("secret", resp.error)
+        self.assertTrue(any("Adapter failed" in record.getMessage() for record in cm.records))
+
+    def test_cancelled_error_propagates(self):
+        async def cancel(prompt, **kwargs):
+            raise asyncio.CancelledError()
+
+        self._set_call(cancel)
+        loop = asyncio.new_event_loop()
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                loop.run_until_complete(
+                    self.daemon._process_request(
+                        AgentRequest(
+                            request_id="r-cancel",
+                            agent_id="test-agent",
+                            prompt="go",
+                        )
+                    )
+                )
+        finally:
+            loop.close()
+
+    def test_resume_fallback_follows_structured_outcome(self):
+        """internal_error blocks the fresh fallback; legacy text errors allow it."""
+        from multinexus.adapters.base import OUTCOME_FAILED, AdapterResult
+
+        def _run_resume(adapter_cls, scope_id):
+            adapter = adapter_cls(self.config)
+            self.daemon.adapter = adapter
+            self.daemon.session_store.upsert(
+                scope_id=scope_id,
+                agent_id=self.config.id,
+                adapter="claude",
+                session_id="sess",
+                work_dir=self.config.work_dir,
+            )
+            result = self._run_adapter(
+                AgentRequest(
+                    request_id="r-resume",
+                    agent_id="test-agent",
+                    prompt="continue",
+                    session_scope=scope_id,
+                )
+            )
+            return adapter, result
+
+        class InternalResumeAdapter(FakeAdapter):
+            def __init__(self, config):
+                super().__init__(config)
+                self._call_count = 0
+
+            async def resume(self, session_id, prompt, **kwargs):
+                self._call_count += 1
+                return AdapterResult(
+                    text="Agent error: internal adapter failure",
+                    outcome=OUTCOME_FAILED,
+                    error_category="internal_error",
+                    diagnostic="boom",
+                    session_id=session_id,
+                )
+
+        adapter, result = _run_resume(InternalResumeAdapter, "channel:internal-resume")
+        # No fresh duplicate; the dead session must not be reactivated.
+        self.assertEqual(adapter._call_count, 1)
+        self.assertIsNone(result.session_id)
+        self.assertEqual(result.error_category, "internal_error")
+
+        class LegacyResumeAdapter(FakeAdapter):
+            def __init__(self, config):
+                super().__init__(config)
+                self._call_count = 0
+
+            async def resume(self, session_id, prompt, **kwargs):
+                self._call_count += 1
+                return AdapterResult(
+                    text="Agent error: resume crashed",
+                    session_id=session_id,
+                )
+
+        adapter, result = _run_resume(LegacyResumeAdapter, "channel:legacy-resume")
+        # Legacy text-only resume error still gets the fresh fallback.
+        self.assertEqual(adapter._call_count, 2)
+        self.assertEqual(result.text, "default response")
 
 
 if __name__ == "__main__":
