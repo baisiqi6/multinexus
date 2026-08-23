@@ -17,6 +17,11 @@ managed adapter：
 每个 `[[agents]]` 条目代表一个独立的平台 bot 身份；`token_env` 指向该身份的
 Discord token 环境变量。只配置已安装并已认证的 executor。
 
+所有 adapter 都返回同一个 `AdapterResult`。`text` 只承载用户可见结果或安全失败摘要；机器终态由
+`outcome`（`success` / `failed` / `timed_out`）和稳定的 `error_category` 决定，不依赖文案前缀。
+`diagnostic` 是最多 4096 UTF-8 bytes 的内部诊断，不自动成为 Discord 回复。旧第三方 adapter 的
+`AdapterResult(text=...)` 仍受兼容，但新失败路径应显式写入 outcome/category，不应建立第二套 result/status 模型。
+
 ## 通用示例
 
 ```toml

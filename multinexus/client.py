@@ -16,7 +16,13 @@ import time
 import discord
 from discord import app_commands
 
-from .adapters.base import AdapterResult
+from .adapters.base import (
+    OUTCOME_FAILED,
+    OUTCOME_SUCCESS,
+    AdapterResult,
+    is_error_text,
+    safe_exception_diagnostic,
+)
 from .adapters.factory import make_adapter
 from .agentd.coordinate_client import CoordinateRuntimeClient, CoordinateRuntimeError
 from .config import load_config
@@ -671,26 +677,38 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
                     ),
                     progress_state=progress_state,
                 )
-                if self._is_error_response(result.text):
+                if result.effective_outcome() != OUTCOME_SUCCESS:
+                    allow_fresh_fallback = getattr(
+                        self.adapter,
+                        "allow_fresh_fallback_after_resume_error",
+                        True,
+                    )
+                    is_internal_error = (
+                        getattr(result, "error_category", None) == "internal_error"
+                    )
                     log.warning(
-                        "Resume failed for session %s, falling back to fresh call",
+                        "Resume failed for session %s (fresh fallback allowed=%s)",
                         existing["session_id"],
+                        allow_fresh_fallback,
                     )
                     self.session_store.mark_stale(
                         scope_id=existing["scope_id"],
                         agent_id=self.agent_config.id,
                     )
                     existing = None
-                    progress_state["partial"] = ""
-                    result = await self._run_with_heartbeat(
-                        placeholder,
-                        self.adapter.call(
-                            prompt,
-                            work_dir=self.agent_config.work_dir,
-                            on_progress=progress_cb,
-                        ),
-                        progress_state=progress_state,
-                    )
+                    if allow_fresh_fallback and not is_internal_error:
+                        progress_state["partial"] = ""
+                        result = await self._run_with_heartbeat(
+                            placeholder,
+                            self.adapter.call(
+                                prompt,
+                                work_dir=self.agent_config.work_dir,
+                                on_progress=progress_cb,
+                            ),
+                            progress_state=progress_state,
+                        )
+                    else:
+                        result.session_id = None
             else:
                 result = await self._run_with_heartbeat(
                     placeholder,
@@ -702,8 +720,16 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
                     progress_state=progress_state,
                 )
         except Exception as exc:
+            # Orchestration boundary: an unexpected exception settles the
+            # request as an explicit internal_error with a bounded diagnostic.
+            # The user-visible text is a safe summary, never the raw exception.
             log.exception("Adapter call failed for agent %s", self.agent_config.id)
-            result = AdapterResult(text=f"Agent error: {exc}")
+            result = AdapterResult(
+                text="Agent error: internal adapter failure",
+                outcome=OUTCOME_FAILED,
+                error_category="internal_error",
+                diagnostic=safe_exception_diagnostic(exc),
+            )
 
         if result.session_id:
             self.session_store.upsert(
@@ -771,6 +797,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         await self._send_adapter_response(
             result.text, channel, placeholder,
             context_channel_id=context_channel_id,
+
+            is_error=result.effective_outcome() != OUTCOME_SUCCESS,
         )
 
     def _session_scope_for_message(
@@ -939,8 +967,13 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         placeholder: discord.Message | None,
         *,
         context_channel_id: str,
+        is_error: bool,
     ) -> None:
-        """Send adapter response to Discord channel (legacy mode)."""
+        """Send adapter response to Discord channel (legacy mode).
+
+        ``is_error`` comes from the AdapterResult machine outcome; context
+        persistence must never reclassify the user-visible text.
+        """
         response_text = self.mention_router.resolve_handoff_mentions(response_text)
         handoff_lines, display_text = split_handoff_lines(response_text)
 
@@ -978,7 +1011,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
             except discord.HTTPException:
                 pass
 
-        if not self._is_error_response(response_text):
+        if not is_error:
             self.context_store.record_message(
                 message_id=f"response:{int(time.time() * 1000)}:{self.agent_config.id}",
                 channel_id=context_channel_id,
@@ -1040,17 +1073,11 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
             except discord.HTTPException:
                 pass
 
-    _ERROR_PREFIXES = (
-        "Agent error:",
-        "OpenCode CLI failed", "OpenCode timed out",
-        "Codex CLI failed", "Codex timed out", "Codex stopped responding", "Codex resume failed",
-        "Hermes CLI failed", "Hermes timed out",
-        "Claude CLI failed", "Claude error:", "Claude timeout",
-    )
-
     @classmethod
     def _is_error_response(cls, text: str) -> bool:
-        return any(text.startswith(p) for p in cls._ERROR_PREFIXES)
+        # Legacy/external compatibility seam for plain-text inputs only.
+        # AdapterResult consumers must read effective_outcome() instead.
+        return is_error_text(text)
 
 
 class DiscordBridge:

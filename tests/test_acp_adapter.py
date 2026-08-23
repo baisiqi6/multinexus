@@ -9,6 +9,7 @@ import acp
 from acp import schema
 
 from multinexus.adapters.acp import ACPAdapter, _AcpClient, _SessionSink
+from multinexus.adapters.base import OUTCOME_FAILED, OUTCOME_TIMED_OUT
 from multinexus.adapters.factory import make_adapter
 from multinexus.config import _load_toml_agent
 from multinexus.models import AgentConfig
@@ -328,10 +329,14 @@ class ACPCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("protocol mismatch", result.text)
         self.assertEqual(conn.new_session_calls, 0)
         h.assert_cleanup_exactly_once(self)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "protocol_error")
 
     async def test_missing_command_fails_cleanly(self):
         result = await ACPAdapter(_config(acp_command="")).call("hi")
         self.assertIn("acp_command is not configured", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "unavailable")
 
     async def test_client_capabilities_fail_closed(self):
         conn = _FakeConnection()
@@ -392,6 +397,8 @@ class ACPResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("failed closed", result.text)
         self.assertEqual(conn.new_session_calls, 0)
         self.assertEqual(conn.prompt_calls, [])
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "protocol_error")
 
 
 class ACPLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -404,6 +411,8 @@ class ACPLifecycleTests(unittest.IsolatedAsyncioTestCase):
         h.assert_cleanup_exactly_once(self)
         self.assertTrue(h.proc.killed)
         self.assertTrue(conn.closed)
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
 
     async def test_caller_cancellation_cleans_up_once_and_reraises(self):
         conn = _FakeConnection(hang=True, session_id="sess-c")
@@ -427,13 +436,22 @@ class ACPLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("boom-SENTINEL-exc", result.text)
         self.assertNotIn("boom-SENTINEL-exc", repr(result.metadata))
         h.assert_cleanup_exactly_once(self)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "provider_error")
+        # Diagnostic keeps only the safe exception type, never the raw detail.
+        self.assertEqual(result.diagnostic, "RuntimeError")
 
     async def test_connection_construction_failure_cleans_up_once(self):
         conn = _FakeConnection()
         with _Harness(conn, connect_error=TypeError("bad stream")) as h:
             result = await ACPAdapter(_config()).call("hi")
+        # Preserve the public user-facing summary while settling the stdio
+        # wiring failure as a process error.
         self.assertEqual(result.text, "ACP error: agent prompt failed")
         self.assertNotIn("bad stream", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "process_error")
+        self.assertEqual(result.diagnostic, "TypeError")
         h.assert_cleanup_exactly_once(self)
 
 
@@ -446,6 +464,7 @@ class ACPSecretSafetyTests(unittest.IsolatedAsyncioTestCase):
                 result = await ACPAdapter(_config()).call("hi")
         self.assertNotIn(sentinel, result.text)
         self.assertNotIn(sentinel, repr(result.metadata))
+        self.assertNotIn(sentinel, result.diagnostic)
         self.assertNotIn(sentinel, "\n".join(logs.output))
 
     def test_health_check_does_not_echo_args(self):

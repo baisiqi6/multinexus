@@ -4,6 +4,7 @@ import logging
 import unittest
 from unittest.mock import patch
 
+from multinexus.adapters.base import OUTCOME_FAILED, OUTCOME_TIMED_OUT
 from multinexus.adapters.claude import ClaudeAdapter
 from multinexus.models import AgentConfig
 
@@ -252,13 +253,20 @@ class ClaudeAdapterProgressTests(unittest.IsolatedAsyncioTestCase):
             provider_error.metadata["provider_evidence"]["observed_model"],
             "observed-model",
         )
+        self.assertEqual(provider_error.outcome, OUTCOME_FAILED)
+        self.assertEqual(provider_error.error_category, "provider_error")
 
         def fail_after_init(update):
             if update["stage"] == "session":
                 raise RuntimeError("progress failed")
 
         ordinary_error = await run(base_events, on_progress=fail_after_init)
-        self.assertIn("progress failed", ordinary_error.text)
+        # Neither the user text nor durable diagnostic copies the raw message.
+        self.assertEqual(ordinary_error.text, "Claude error: internal failure")
+        self.assertNotIn("progress failed", ordinary_error.text)
+        self.assertEqual(ordinary_error.diagnostic, "RuntimeError")
+        self.assertEqual(ordinary_error.outcome, OUTCOME_FAILED)
+        self.assertEqual(ordinary_error.error_category, "internal_error")
         self.assertEqual(
             ordinary_error.metadata["provider_evidence"]["session_id"],
             "sess-error",
@@ -465,6 +473,8 @@ class ClaudeAdapterCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["requested_model"], "requested-model")
         self.assertEqual(evidence["observed_model"], "observed-model")
         self.assertEqual(evidence["cli_version"], "2.1.212")
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
 
     async def test_cancellation_kills_process(self):
         proc = _FakeProcess(hang=True)
@@ -519,4 +529,9 @@ class ClaudeAdapterCleanupTests(unittest.IsolatedAsyncioTestCase):
             result = await adapter.call("hang")
 
         self.assertEqual(cleanup_calls, [proc])
-        self.assertIn("process group cleanup failed", result.text)
+        # Caught unexpected exception settles safely; details stay in logs.
+        self.assertEqual(result.text, "Claude error: internal failure")
+        self.assertNotIn("process group cleanup failed", result.text)
+        self.assertEqual(result.diagnostic, "RuntimeError")
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "internal_error")

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from multinexus.adapters.base import OUTCOME_FAILED, OUTCOME_TIMED_OUT
 from multinexus.adapters.codex import CodexAdapter
 from multinexus.config import _load_toml_agent
 from multinexus.models import AgentConfig
@@ -230,6 +231,8 @@ class TestCodexProcessGroups(unittest.IsolatedAsyncioTestCase):
         self.assertIs(spawn_kwargs["start_new_session"], True)
         self.assertEqual(cleanup_calls, [proc])
         self.assertIn("stopped responding", result.text)
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
 
     async def test_resume_spawns_owned_group_and_cleans_activity_timeout_once(self):
         proc = _FakeProcess(hang=True)
@@ -262,6 +265,8 @@ class TestCodexProcessGroups(unittest.IsolatedAsyncioTestCase):
         self.assertIs(spawn_kwargs["start_new_session"], True)
         self.assertEqual(cleanup_calls, [proc])
         self.assertIn("stopped responding", result.text)
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
         self.assertTrue(result.resumed)
 
     async def test_cleanup_failure_is_explicit_and_not_retried(self):
@@ -287,3 +292,140 @@ class TestCodexProcessGroups(unittest.IsolatedAsyncioTestCase):
                 await adapter.call("hang")
 
         self.assertEqual(cleanup_calls, [proc])
+
+class TestCodexSettlement(unittest.IsolatedAsyncioTestCase):
+    """Explicit outcome/category settlements for the closed failure paths."""
+
+    async def test_total_timeout_is_timed_out(self):
+        proc = _FakeProcess(hang=True)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        async def fake_cleanup(target):
+            target.kill()
+            await target.wait()
+
+        adapter = CodexAdapter(_config(timeout=0))
+        with (
+            patch("multinexus.adapters.codex.asyncio.create_subprocess_exec", new=fake_exec),
+            patch(
+                "multinexus.adapters.codex.terminate_owned_process_group",
+                new=fake_cleanup,
+            ),
+        ):
+            result = await adapter.call("hang")
+        self.assertIn("timed out", result.text)
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
+
+    async def test_empty_response_is_no_response(self):
+        proc = _FakeProcess(
+            [{"type": "thread.started", "thread_id": "t-1"}], returncode=0
+        )
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with patch(
+            "multinexus.adapters.codex.asyncio.create_subprocess_exec", new=fake_exec
+        ):
+            result = await CodexAdapter(_config()).call("x")
+        self.assertEqual(result.text, "(no response)")
+        self.assertEqual(result.session_id, "t-1")
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "no_response")
+
+    async def test_nonzero_exit_is_process_error(self):
+        proc = _FakeProcess([], returncode=3)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with patch(
+            "multinexus.adapters.codex.asyncio.create_subprocess_exec", new=fake_exec
+        ):
+            result = await CodexAdapter(_config()).call("x")
+        self.assertIn("Codex CLI failed (3)", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "process_error")
+
+    async def test_capacity_error_is_provider_error(self):
+        proc = _FakeProcess(
+            [{"type": "error", "message": "selected model is at capacity"}],
+            returncode=1,
+        )
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with patch(
+            "multinexus.adapters.codex.asyncio.create_subprocess_exec", new=fake_exec
+        ):
+            result = await CodexAdapter(_config()).call("x")
+        self.assertIn("capacity", result.text.lower())
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "provider_error")
+
+    async def test_capacity_fallback_uses_fallback_model(self):
+        calls = []
+
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                return _FakeProcess(
+                    [{"type": "error", "message": "selected model is at capacity"}],
+                    returncode=1,
+                )
+            return _FakeProcess(
+                [{"item": {"type": "agent_message", "text": "fallback ok"}}],
+                returncode=0,
+            )
+
+        adapter = CodexAdapter(
+            _config(model="primary", codex_fallback_model="fallback")
+        )
+        with patch(
+            "multinexus.adapters.codex.asyncio.create_subprocess_exec", new=fake_exec
+        ):
+            result = await adapter.call("x")
+        self.assertEqual(result.text, "fallback ok")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--model", calls[1])
+        self.assertIn("fallback", calls[1])
+
+    async def test_missing_cli_is_unavailable(self):
+        async def fake_exec(*args, **kwargs):
+            raise FileNotFoundError
+
+        adapter = CodexAdapter(_config(codex_bin="/no/such/codex"))
+        with patch(
+            "multinexus.adapters.codex.asyncio.create_subprocess_exec", new=fake_exec
+        ):
+            result = await adapter.call("x")
+        self.assertIn("Codex CLI not found", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "unavailable")
+
+        with patch(
+            "multinexus.adapters.codex.asyncio.create_subprocess_exec", new=fake_exec
+        ):
+            result = await adapter.resume("t-1", "x")
+        self.assertIn("Codex CLI not found", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "unavailable")
+
+    async def test_resume_nonzero_is_protocol_error(self):
+        proc = _FakeProcess([], returncode=4)
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        with patch(
+            "multinexus.adapters.codex.asyncio.create_subprocess_exec", new=fake_exec
+        ):
+            result = await CodexAdapter(_config()).resume("t-1", "x")
+        self.assertIn("Codex resume failed (4)", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "protocol_error")
+        self.assertTrue(result.resumed)

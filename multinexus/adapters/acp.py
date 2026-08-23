@@ -31,7 +31,7 @@ import acp
 from acp import schema
 
 from ..models import AgentConfig
-from .base import AdapterResult, AgentAdapter
+from .base import AdapterResult, AgentAdapter, failed_result, timed_out_result
 from .utils import async_subprocess_kwargs, filtered_env, terminate_owned_process_group
 
 log = logging.getLogger(__name__)
@@ -217,7 +217,10 @@ class ACPAdapter(AgentAdapter):
         resume_session_id: str | None = None,
     ) -> AdapterResult:
         if not self.config.acp_command:
-            return AdapterResult(text="ACP error: acp_command is not configured")
+            return failed_result(
+                text="ACP error: acp_command is not configured",
+                category="unavailable",
+            )
 
         timeout = timeout or self.config.timeout
         cwd = work_dir or self.config.work_dir or os.getcwd()
@@ -238,16 +241,22 @@ class ACPAdapter(AgentAdapter):
                 **async_subprocess_kwargs(),
             )
         except FileNotFoundError:
-            return AdapterResult(
-                text=f"ACP command not found: {self.config.acp_command}"
+            return failed_result(
+                text=f"ACP command not found: {self.config.acp_command}",
+                category="unavailable",
             )
         except Exception:
             log.exception("acp spawn failed for command %r", self.config.acp_command)
-            return AdapterResult(text="ACP error: spawn failed")
-
+            return failed_result(
+                text="ACP error: spawn failed",
+                category="process_error",
+            )
         if proc.stdin is None or proc.stdout is None:
             await self._cleanup_process(proc)
-            return AdapterResult(text="ACP error: subprocess stdio unavailable")
+            return failed_result(
+                text="ACP error: subprocess stdio unavailable",
+                category="process_error",
+            )
 
         sink = _SessionSink(on_progress)
         conn = None
@@ -255,7 +264,15 @@ class ACPAdapter(AgentAdapter):
             # create_subprocess_exec already hands us a StreamWriter (stdin)
             # and a StreamReader (stdout); pass them straight to the SDK with
             # no second connect_read_pipe/StreamWriter wrapping.
-            conn = acp.connect_to_agent(_AcpClient(sink), proc.stdin, proc.stdout)
+            try:
+                conn = acp.connect_to_agent(_AcpClient(sink), proc.stdin, proc.stdout)
+            except Exception as exc:
+                log.warning("acp connect failed: %s", self._safe_error_summary(exc))
+                return failed_result(
+                    text="ACP error: agent prompt failed",
+                    category="process_error",
+                    diagnostic=self._safe_error_summary(exc),
+                )
             return await asyncio.wait_for(
                 self._converse(conn, sink, prompt, cwd, resume_session_id),
                 timeout=timeout,
@@ -263,7 +280,7 @@ class ACPAdapter(AgentAdapter):
         except asyncio.TimeoutError:
             if conn is not None:
                 await self._best_effort_cancel(conn, sink, resume_session_id)
-            return AdapterResult(
+            return timed_out_result(
                 text=f"ACP timeout after {timeout}s. Aborted, no handoff.",
                 session_id=self._session_id(sink, resume_session_id),
                 metadata={"timeout": {"kind": "total", "configured_budget_seconds": timeout}},
@@ -274,11 +291,13 @@ class ACPAdapter(AgentAdapter):
             raise
         except Exception as exc:
             # Never splice raw exception or stderr into user-visible text;
-            # sensitive diagnostics go to the internal log only.
+            # only the safe exception type enters the bounded diagnostic.
             log.warning("acp prompt failed: %s", self._safe_error_summary(exc))
-            return AdapterResult(
+            return failed_result(
                 text="ACP error: agent prompt failed",
+                category="provider_error",
                 session_id=self._session_id(sink, resume_session_id),
+                diagnostic=self._safe_error_summary(exc),
             )
         finally:
             if conn is not None:
@@ -295,11 +314,12 @@ class ACPAdapter(AgentAdapter):
         resume_session_id: str | None,
     ) -> AdapterResult:
         if acp.PROTOCOL_VERSION != EXPECTED_PROTOCOL_VERSION:
-            return AdapterResult(
+            return failed_result(
                 text=(
                     "ACP protocol mismatch: SDK speaks "
                     f"v{acp.PROTOCOL_VERSION}, adapter requires v{EXPECTED_PROTOCOL_VERSION}"
-                )
+                ),
+                category="protocol_error",
             )
 
         init = await conn.initialize(
@@ -307,11 +327,12 @@ class ACPAdapter(AgentAdapter):
             client_capabilities=_build_client_capabilities(),
         )
         if init.protocol_version != EXPECTED_PROTOCOL_VERSION:
-            return AdapterResult(
+            return failed_result(
                 text=(
                     "ACP protocol mismatch: agent negotiated "
                     f"v{init.protocol_version}, adapter requires v{EXPECTED_PROTOCOL_VERSION}"
-                )
+                ),
+                category="protocol_error",
             )
 
         resumed = False
@@ -320,11 +341,12 @@ class ACPAdapter(AgentAdapter):
                 conn, init.agent_capabilities, resume_session_id, cwd
             )
             if not resumed:
-                return AdapterResult(
+                return failed_result(
                     text=(
                         "ACP resume failed closed: agent declares no "
                         "session/resume or legacy session/load capability"
                     ),
+                    category="protocol_error",
                     session_id=resume_session_id,
                     metadata=self._metadata(init, None),
                 )
@@ -340,12 +362,21 @@ class ACPAdapter(AgentAdapter):
             prompt=[schema.TextContentBlock(type="text", text=full_prompt)],
         )
         stop_reason = str(getattr(response, "stop_reason", "") or "")
-
+        metadata = self._metadata(init, stop_reason)
+        response_text = sink.final_text()
+        if not response_text:
+            return failed_result(
+                text="(no response)",
+                category="no_response",
+                session_id=session_id,
+                resumed=resumed,
+                metadata=metadata,
+            )
         return AdapterResult(
-            text=sink.final_text() or "(no response)",
+            text=response_text,
             session_id=session_id,
             resumed=resumed,
-            metadata=self._metadata(init, stop_reason),
+            metadata=metadata,
         )
 
     async def _resume_session(

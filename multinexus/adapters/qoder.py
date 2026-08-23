@@ -15,7 +15,7 @@ import shutil
 from typing import Any
 
 from ..models import AgentConfig
-from .base import AdapterResult, AgentAdapter
+from .base import AdapterResult, AgentAdapter, failed_result, timed_out_result
 from .utils import async_subprocess_kwargs, filtered_env, terminate_owned_process_group
 
 log = logging.getLogger(__name__)
@@ -102,10 +102,16 @@ class QoderAdapter(AgentAdapter):
                 **async_subprocess_kwargs(),
             )
         except FileNotFoundError:
-            return AdapterResult(text=f"Qoder CLI not found: {self.config.qoder_bin}")
+            return failed_result(
+                text=f"Qoder CLI not found: {self.config.qoder_bin}",
+                category="unavailable",
+            )
         except Exception as exc:
             log.warning("qoder spawn failed: %s", type(exc).__name__)
-            return AdapterResult(text="Qoder error: spawn failed")
+            return failed_result(
+                text="Qoder error: spawn failed",
+                category="process_error",
+            )
 
         cleaned = False
 
@@ -123,7 +129,7 @@ class QoderAdapter(AgentAdapter):
             )
         except asyncio.TimeoutError:
             await cleanup()
-            return AdapterResult(
+            return timed_out_result(
                 text=f"Qoder timeout after {timeout}s. Aborted, no handoff.",
                 session_id=resume_session_id,
                 metadata={
@@ -139,27 +145,31 @@ class QoderAdapter(AgentAdapter):
         except Exception as exc:
             await cleanup()
             log.warning("qoder execution failed: %s", type(exc).__name__)
-            return AdapterResult(
+            return failed_result(
                 text="Qoder error: execution failed",
+                category="process_error",
                 session_id=resume_session_id,
             )
 
         if proc.returncode != 0:
-            return AdapterResult(
+            return failed_result(
                 text=f"Qoder CLI failed ({proc.returncode})",
+                category="process_error",
                 session_id=resume_session_id,
             )
 
         try:
             payload = json.loads(stdout.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-            return AdapterResult(
+            return failed_result(
                 text="Qoder error: invalid JSON response",
+                category="protocol_error",
                 session_id=resume_session_id,
             )
         if not isinstance(payload, dict) or payload.get("is_error"):
-            return AdapterResult(
+            return failed_result(
                 text="Qoder error: provider returned an error",
+                category="provider_error",
                 session_id=resume_session_id,
             )
 
@@ -167,8 +177,9 @@ class QoderAdapter(AgentAdapter):
         if not isinstance(session_id, str) or not session_id:
             session_id = resume_session_id
         if resume_session_id and session_id != resume_session_id:
-            return AdapterResult(
+            return failed_result(
                 text="Qoder resume failed: session mismatch",
+                category="protocol_error",
                 session_id=resume_session_id,
             )
 
@@ -183,8 +194,17 @@ class QoderAdapter(AgentAdapter):
                     "session_id": session_id or "",
                 }
             )
+        if not response_text:
+            return failed_result(
+                text="(no response)",
+                category="no_response",
+                session_id=session_id,
+                resumed=bool(resume_session_id),
+                metadata=metadata,
+            )
+
         return AdapterResult(
-            text=response_text or "(no response)",
+            text=response_text,
             session_id=session_id,
             resumed=bool(resume_session_id),
             metadata=metadata,

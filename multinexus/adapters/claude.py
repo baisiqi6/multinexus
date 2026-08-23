@@ -4,7 +4,13 @@ import logging
 from typing import Any
 
 from ..models import AgentConfig
-from .base import AdapterResult, AgentAdapter
+from .base import (
+    AdapterResult,
+    AgentAdapter,
+    failed_result,
+    safe_exception_diagnostic,
+    timed_out_result,
+)
 from .utils import async_subprocess_kwargs, filtered_env, terminate_owned_process_group
 
 log = logging.getLogger(__name__)
@@ -261,7 +267,10 @@ class ClaudeAdapter(AgentAdapter):
                 **async_subprocess_kwargs(),
             )
         except FileNotFoundError:
-            return AdapterResult(text=f"Claude CLI not found: {self.config.claude_bin}")
+            return failed_result(
+                text=f"Claude CLI not found: {self.config.claude_bin}",
+                category="unavailable",
+            )
 
         response_text = ""
         session_id: str | None = resume_session_id
@@ -292,7 +301,7 @@ class ClaudeAdapter(AgentAdapter):
                 now = loop.time()
                 if now >= deadline:
                     await cleanup()
-                    return AdapterResult(
+                    return timed_out_result(
                         text=_timeout_message("total", timeout, timeout),
                         session_id=session_id,
                         metadata=_metadata_with_evidence(
@@ -317,7 +326,7 @@ class ClaudeAdapter(AgentAdapter):
                     elapsed = loop.time() - last_activity
                     if not saw_output and elapsed >= self.config.first_byte_timeout:
                         await cleanup()
-                        return AdapterResult(
+                        return timed_out_result(
                             text=_timeout_message("first_byte", self.config.first_byte_timeout, timeout),
                             session_id=session_id,
                             metadata=_metadata_with_evidence(
@@ -332,7 +341,7 @@ class ClaudeAdapter(AgentAdapter):
                         )
                     if saw_output and elapsed >= self.config.activity_timeout:
                         await cleanup()
-                        return AdapterResult(
+                        return timed_out_result(
                             text=_timeout_message("activity", self.config.activity_timeout, timeout),
                             session_id=session_id,
                             metadata=_metadata_with_evidence(
@@ -385,8 +394,9 @@ class ClaudeAdapter(AgentAdapter):
                     )
                 if event.get("type") == "result":
                     if event.get("subtype") == "error" or event.get("is_error"):
-                        return AdapterResult(
+                        return failed_result(
                             text=f"Claude error: {event.get('result', '')[:500]}",
+                            category="provider_error",
                             session_id=session_id,
                             metadata=_metadata_with_evidence(evidence),
                         )
@@ -396,15 +406,25 @@ class ClaudeAdapter(AgentAdapter):
             if not response_text and proc.returncode != 0:
                 assert proc.stderr is not None
                 stderr = (await proc.stderr.read()).decode("utf-8", errors="replace")
-                return AdapterResult(
+                return failed_result(
                     text=f"Claude CLI failed ({proc.returncode}): {stderr[:500]}",
+                    category="process_error",
                     session_id=session_id,
                     metadata=_metadata_with_evidence(evidence),
                 )
+            metadata = _metadata_with_evidence(evidence)
+            response_text = response_text.strip()
+            if not response_text:
+                return failed_result(
+                    text="(no response)",
+                    category="no_response",
+                    session_id=session_id,
+                    metadata=metadata,
+                )
             return AdapterResult(
-                text=response_text.strip() or "(no response)",
+                text=response_text,
                 session_id=session_id,
-                metadata=_metadata_with_evidence(evidence),
+                metadata=metadata,
             )
         except asyncio.CancelledError:
             await cleanup()
@@ -412,10 +432,13 @@ class ClaudeAdapter(AgentAdapter):
         except Exception as exc:
             if not cleanup_attempted:
                 await cleanup()
-            return AdapterResult(
-                text=f"Claude error: {exc}",
+            log.warning("claude prompt failed: %s", type(exc).__name__)
+            return failed_result(
+                text="Claude error: internal failure",
+                category="internal_error",
                 session_id=session_id,
                 metadata=_metadata_with_evidence(evidence),
+                diagnostic=safe_exception_diagnostic(exc),
             )
 
     async def health_check(self) -> dict:

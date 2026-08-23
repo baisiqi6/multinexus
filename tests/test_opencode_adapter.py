@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from multinexus.adapters.opencode import OpenCodeAdapter
 from multinexus.models import AgentConfig
+from multinexus.adapters.base import OUTCOME_FAILED, OUTCOME_TIMED_OUT
 
 
 class _FakeStream:
@@ -141,6 +142,8 @@ class OpenCodeAdapterRetryTests(unittest.TestCase):
             "OpenCode returned no text (events=step_start,tool_use)",
         )
         self.assertEqual(len(calls), 1)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "no_response")
 
     def test_empty_success_eventually_fails_after_retries(self):
         calls = []
@@ -162,6 +165,8 @@ class OpenCodeAdapterRetryTests(unittest.TestCase):
 
         self.assertEqual(result.text, "OpenCode returned no text (events=step_start)")
         self.assertEqual(len(calls), 5)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "no_response")
 
 
 class OpenCodeAdapterCancellationTests(unittest.IsolatedAsyncioTestCase):
@@ -232,6 +237,8 @@ class OpenCodeAdapterCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(spawn_kwargs["stdin"], asyncio.subprocess.PIPE)
         self.assertEqual(cleanup_calls, [proc])
         self.assertIn("no output", result.text)
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
 
     async def test_cleanup_failure_is_explicit_and_not_retried(self):
         proc = _FakeProcess([], hang=True, returncode=None)
@@ -258,6 +265,23 @@ class OpenCodeAdapterCancellationTests(unittest.IsolatedAsyncioTestCase):
                 await adapter.call("hello")
 
         self.assertEqual(cleanup_calls, [proc])
+
+
+class OpenCodeAdapterMissingCliTests(unittest.IsolatedAsyncioTestCase):
+    async def test_file_not_found(self):
+        async def fake_create(*args, **kwargs):
+            raise FileNotFoundError
+
+        adapter = OpenCodeAdapter(_config(opencode_bin="/no/such/opencode"))
+        with patch(
+            "multinexus.adapters.opencode.asyncio.create_subprocess_exec", fake_create
+        ):
+            result = await adapter.call("test")
+
+        self.assertIn("OpenCode CLI not found", result.text)
+        self.assertIn("/no/such/opencode", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "unavailable")
 
 
 if __name__ == "__main__":

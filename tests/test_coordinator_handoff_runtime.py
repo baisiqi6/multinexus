@@ -1194,5 +1194,214 @@ class TestLifecycleSessionStoreNone(unittest.TestCase):
         self.assertTrue(handled)
 
 
+class TestCoordinatorHandoffOutcomeContract(unittest.TestCase):
+    """R2: handoff is_error reads the machine outcome, never the visible text.
+
+    Legacy (direct adapter) path uses AdapterResult.effective_outcome();
+    agentd path keeps Coordinate status as terminal authority, then prefers
+    a structured outcome projection over the text seam for done jobs.
+    """
+
+    def _run_handoff(self, instance, msg, *, resolved_workspace=None):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(
+                instance._try_coordinator_handoff(
+                    msg, resolved_workspace=resolved_workspace
+                )
+            )
+        finally:
+            loop.close()
+
+    def _legacy_instance(self, call_result):
+        config = _make_config()
+        msg = _make_handoff_message()
+        instance = _make_runtime_client(config)
+        instance.adapter.call = AsyncMock(return_value=call_result)
+        return instance, msg
+
+    def _run_legacy_handoff(self, instance, msg):
+        with (
+            patch(
+                "multinexus.client.execute_assignment_accept",
+                return_value=(True, "accepted"),
+            ),
+            patch("multinexus.client.read_bootstrap", return_value="# b"),
+        ):
+            self._run_handoff(instance, msg)
+
+    def _agentd_instance(self, *, completed):
+        config = _make_config(agentd_mode=True)
+        msg = _make_handoff_message()
+        instance = _make_runtime_client(config)
+        instance._agentd_mode = True
+        instance.session_store = None
+        instance._coordinate_client = MagicMock()
+        instance._coordinate_client.submit_request = AsyncMock(
+            return_value={"result": {"job": {"id": "request:agentd"}}}
+        )
+        instance._coordinate_client.wait_for_job_result = AsyncMock(
+            return_value=completed
+        )
+        return instance, msg
+
+    def _run_agentd_handoff(self, instance, msg):
+        with (
+            patch(
+                "multinexus.client.execute_assignment_accept",
+                return_value=(True, "accepted"),
+            ),
+            patch("multinexus.client.read_bootstrap", return_value="bootstrap"),
+        ):
+            self._run_handoff(instance, msg, resolved_workspace="multinexus")
+
+    def test_legacy_is_error_reads_outcome_not_text(self):
+        from multinexus.adapters.base import OUTCOME_FAILED, OUTCOME_SUCCESS
+
+        cases = [
+            # (name, reply text, outcome, context should be recorded)
+            ("success outcome with error-like text", "OpenCode CLI failed", OUTCOME_SUCCESS, True),
+            ("failed outcome with plain text", "looks fine", OUTCOME_FAILED, False),
+        ]
+        for name, text, outcome, records in cases:
+            with self.subTest(name=name):
+                instance, msg = self._legacy_instance(
+                    AdapterResult(
+                        text=text,
+                        outcome=outcome,
+                        error_category=(
+                            "provider_error" if outcome == OUTCOME_FAILED else None
+                        ),
+                        session_id=None,
+                    )
+                )
+                self._run_legacy_handoff(instance, msg)
+                if records:
+                    instance.context_store.record_message.assert_called()
+                else:
+                    instance.context_store.record_message.assert_not_called()
+
+    def test_agentd_structured_outcome_governs_done_jobs(self):
+        cases = [
+            # (name, completed dict, context should be recorded)
+            (
+                "failed outcome with plain text",
+                {
+                    "id": "request:sf",
+                    "status": "done",
+                    "result": {
+                        "response_text": "looks fine",
+                        "outcome": "failed",
+                        "error_category": "provider_error",
+                    },
+                },
+                False,
+            ),
+            (
+                "success outcome with error-like text",
+                {
+                    "id": "request:ss",
+                    "status": "done",
+                    "result": {
+                        "response_text": "OpenCode CLI failed",
+                        "outcome": "success",
+                    },
+                },
+                True,
+            ),
+        ]
+        for name, completed, records in cases:
+            with self.subTest(name=name):
+                instance, msg = self._agentd_instance(completed=completed)
+                self._run_agentd_handoff(instance, msg)
+                instance._coordinate_client.submit_request.assert_awaited_once()
+                if records:
+                    instance.context_store.record_message.assert_called()
+                else:
+                    instance.context_store.record_message.assert_not_called()
+
+    def test_agentd_non_done_status_is_error_regardless_of_outcome(self):
+        """Coordinate job status is terminal authority over any projection."""
+        instance, msg = self._agentd_instance(
+            completed={
+                "id": "request:conflict",
+                "status": "failed",
+                "result": {"response_text": "plain", "outcome": "success"},
+            }
+        )
+        self._run_agentd_handoff(instance, msg)
+        instance._coordinate_client.submit_request.assert_awaited_once()
+        instance.context_store.record_message.assert_not_called()
+
+    def test_agentd_malformed_outcome_falls_back_to_text_seam(self):
+        cases = [
+            # malformed outcome + error-like text => error via text seam
+            ({"response_text": "OpenCode CLI failed", "outcome": "bogus"}, False),
+            # malformed outcome + plain text => legacy seam decides success
+            ({"response_text": "plain reply", "outcome": "bogus"}, True),
+        ]
+        for result, records in cases:
+            with self.subTest(result=result):
+                instance, msg = self._agentd_instance(
+                    completed={
+                        "id": "request:malformed",
+                        "status": "done",
+                        "result": result,
+                    }
+                )
+                self._run_agentd_handoff(instance, msg)
+                if records:
+                    instance.context_store.record_message.assert_called()
+                else:
+                    instance.context_store.record_message.assert_not_called()
+
+    def test_agentd_legacy_payload_keeps_status_text_seam(self):
+        instance, msg = self._agentd_instance(
+            completed={
+                "id": "request:legacy",
+                "status": "failed",
+                "result": {"response_text": "plain reply"},
+            }
+        )
+        self._run_agentd_handoff(instance, msg)
+        instance._coordinate_client.submit_request.assert_awaited_once()
+        instance.context_store.record_message.assert_not_called()
+
+
+class TestSendAdapterResponseContextDecision(unittest.TestCase):
+    """R2: legacy context persistence follows the machine outcome, not text."""
+
+    def _send(self, instance, response_text, is_error):
+        channel = MagicMock()
+        channel.send = AsyncMock(return_value=MagicMock())
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(
+                instance._send_adapter_response(
+                    response_text,
+                    channel,
+                    None,
+                    context_channel_id="ch-ctx",
+                    is_error=is_error,
+                )
+            )
+        finally:
+            loop.close()
+
+    def test_context_persistence_follows_outcome_not_text(self):
+        cases = [
+            ("error-like text with success outcome", "OpenCode CLI failed", False, True),
+            ("plain text with failed outcome", "looks fine", True, False),
+        ]
+        for name, text, is_error, records in cases:
+            with self.subTest(name=name):
+                instance = _make_runtime_client()
+                self._send(instance, text, is_error)
+                if records:
+                    instance.context_store.record_message.assert_called()
+                else:
+                    instance.context_store.record_message.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

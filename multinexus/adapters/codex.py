@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..models import AgentConfig
-from .base import AdapterResult, AgentAdapter
+from .base import CATEGORY_TIMEOUT, AdapterResult, AgentAdapter, failed_result, timed_out_result
 from .utils import async_subprocess_kwargs, filtered_env, terminate_owned_process_group
 
 log = logging.getLogger(__name__)
@@ -27,6 +27,9 @@ class CodexRunResult:
     text: str
     session_id: str | None = None
     capacity_error: bool = False
+    # Minimal closed failure information (a FAILURE_CATEGORIES value, or None
+    # for success) carried to the single conversion seam in call().
+    error_category: str | None = None
 
 
 def extract_codex_text(event: dict[str, Any]) -> str:
@@ -98,9 +101,7 @@ class CodexAdapter(AgentAdapter):
         effective_work_dir = work_dir or self.config.work_dir
         primary = await self._run_once(full_prompt, model=self.config.model, work_dir=effective_work_dir)
         if not primary.capacity_error:
-            return AdapterResult(
-                text=primary.text, session_id=primary.session_id
-            )
+            return self._from_run_result(primary)
 
         fallback_model = self.config.codex_fallback_model
         if fallback_model and fallback_model != self.config.model:
@@ -111,15 +112,15 @@ class CodexAdapter(AgentAdapter):
             )
             fallback = await self._run_once(full_prompt, model=fallback_model, work_dir=effective_work_dir)
             if not fallback.capacity_error:
-                return AdapterResult(
-                    text=fallback.text, session_id=fallback.session_id
-                )
-            return AdapterResult(
-                text=self._capacity_failure_message(self.config.model, fallback_model)
+                return self._from_run_result(fallback)
+            return failed_result(
+                text=self._capacity_failure_message(self.config.model, fallback_model),
+                category="provider_error",
             )
 
-        return AdapterResult(
-            text=self._capacity_failure_message(self.config.model, None)
+        return failed_result(
+            text=self._capacity_failure_message(self.config.model, None),
+            category="provider_error",
         )
 
     async def resume(
@@ -191,6 +192,24 @@ class CodexAdapter(AgentAdapter):
             "Configure codex_fallback_model to auto-retry."
         )
 
+    @staticmethod
+    def _from_run_result(run: CodexRunResult) -> AdapterResult:
+        """Single seam converting the internal CodexRunResult to AdapterResult.
+
+        Success keeps the legacy plain construction; failures settle with
+        their closed category explicitly. The capacity fallback decision has
+        already happened in ``call`` before this seam is reached.
+        """
+        if run.error_category is None:
+            return AdapterResult(text=run.text, session_id=run.session_id)
+        if run.error_category == CATEGORY_TIMEOUT:
+            return timed_out_result(text=run.text, session_id=run.session_id)
+        return failed_result(
+            text=run.text,
+            category=run.error_category,
+            session_id=run.session_id,
+        )
+
     async def _run_once(self, full_prompt: str, model: str | None, *, work_dir: str | None = None) -> CodexRunResult:
         cmd = self._build_cmd(model)
         timeout = self.config.timeout
@@ -208,7 +227,10 @@ class CodexAdapter(AgentAdapter):
                 **async_subprocess_kwargs(),
             )
         except FileNotFoundError:
-            return CodexRunResult(f"Codex CLI not found: {self.config.codex_bin}")
+            return CodexRunResult(
+                f"Codex CLI not found: {self.config.codex_bin}",
+                error_category="unavailable",
+            )
 
         return await _run_codex_process(proc, full_prompt, timeout, self.config.activity_timeout)
 
@@ -234,7 +256,10 @@ class CodexAdapter(AgentAdapter):
                 **async_subprocess_kwargs(),
             )
         except FileNotFoundError:
-            return AdapterResult(text=f"Codex CLI not found: {self.config.codex_bin}")
+            return failed_result(
+                text=f"Codex CLI not found: {self.config.codex_bin}",
+                category="unavailable",
+            )
 
         cleanup_attempted = False
 
@@ -262,7 +287,7 @@ class CodexAdapter(AgentAdapter):
                 now = loop.time()
                 if now >= deadline:
                     await cleanup()
-                    return AdapterResult(text=f"Codex timed out after {timeout}s")
+                    return timed_out_result(text=f"Codex timed out after {timeout}s")
 
                 assert proc.stdout is not None
                 read_timeout = min(self.config.activity_timeout, deadline - now)
@@ -271,7 +296,7 @@ class CodexAdapter(AgentAdapter):
                 except asyncio.TimeoutError:
                     if loop.time() - last_activity >= self.config.activity_timeout:
                         await cleanup()
-                        return AdapterResult(
+                        return timed_out_result(
                             text=f"Codex stopped responding for {self.config.activity_timeout}s"
                         )
                     continue
@@ -299,14 +324,23 @@ class CodexAdapter(AgentAdapter):
                 assert proc.stderr is not None
                 stderr = (await proc.stderr.read()).decode("utf-8", errors="replace").strip()
                 detail = stderr or error_text or f"exit code {proc.returncode}"
-                return AdapterResult(
+                return failed_result(
                     text=f"Codex resume failed ({proc.returncode}): {detail[:500]}",
+                    category="protocol_error",
                     session_id=session_id,
                     resumed=True,
                 )
 
+            response_text = response_text.strip()
+            if not response_text:
+                return failed_result(
+                    text="(no response)",
+                    category="no_response",
+                    session_id=session_id,
+                    resumed=True,
+                )
             return AdapterResult(
-                text=response_text.strip() or "(no response)",
+                text=response_text,
                 session_id=session_id,
                 resumed=True,
             )
@@ -359,7 +393,11 @@ async def _run_codex_process(
             now = loop.time()
             if now >= deadline:
                 await cleanup()
-                return CodexRunResult(f"Codex timed out after {timeout}s", session_id=session_id)
+                return CodexRunResult(
+                    f"Codex timed out after {timeout}s",
+                    session_id=session_id,
+                    error_category=CATEGORY_TIMEOUT,
+                )
 
             assert proc.stdout is not None
             read_timeout = min(activity_timeout, deadline - now)
@@ -371,6 +409,7 @@ async def _run_codex_process(
                     return CodexRunResult(
                         f"Codex stopped responding for {activity_timeout}s",
                         session_id=session_id,
+                        error_category=CATEGORY_TIMEOUT,
                     )
                 continue
             if not raw:
@@ -410,8 +449,16 @@ async def _run_codex_process(
                 f"Codex CLI failed ({proc.returncode}): {detail[:500]}",
                 session_id=session_id,
                 capacity_error=capacity_error,
+                error_category=(
+                    "provider_error" if capacity_error else "process_error"
+                ),
             )
-        return CodexRunResult(response_text.strip() or "(no response)", session_id=session_id)
+        response_text = response_text.strip()
+        if not response_text:
+            return CodexRunResult(
+                "(no response)", session_id=session_id, error_category="no_response"
+            )
+        return CodexRunResult(response_text, session_id=session_id)
     except asyncio.CancelledError:
         await cleanup()
         raise

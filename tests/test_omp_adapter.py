@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from multinexus.adapters.base import AdapterResult
+from multinexus.adapters.base import AdapterResult, OUTCOME_FAILED, OUTCOME_TIMED_OUT
 from multinexus.adapters.factory import make_adapter
 from multinexus.adapters.omp import OmpAdapter
 from multinexus.models import AgentConfig
@@ -122,6 +122,8 @@ class TestOmpCall(unittest.IsolatedAsyncioTestCase):
             result = await adapter.call("test")
 
         self.assertEqual(result.text, "(no response)")
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "no_response")
 
     async def test_nonzero_exit_returns_stderr(self):
         async def fake_exec(*args, **kwargs):
@@ -133,6 +135,8 @@ class TestOmpCall(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("omp CLI failed (2)", result.text)
         self.assertIn("config error", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "process_error")
 
     async def test_nonzero_exit_with_stdout_returns_error(self):
         proc = FakeProcess(returncode=1, stdout=b"partial output\n", stderr=b"fatal error")
@@ -177,6 +181,8 @@ class TestOmpMissingCLI(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("omp CLI not found", result.text)
         self.assertIn("/no/such/omp", result.text)
+        self.assertEqual(result.outcome, OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "unavailable")
 
 
 class TestOmpTimeout(unittest.IsolatedAsyncioTestCase):
@@ -211,6 +217,8 @@ class TestOmpTimeout(unittest.IsolatedAsyncioTestCase):
         self.assertIn("timed out after 5s", result.text)
         self.assertTrue(proc.killed)
         self.assertEqual(cleanup_calls, [proc])
+        self.assertEqual(result.outcome, OUTCOME_TIMED_OUT)
+        self.assertEqual(result.error_category, "timeout")
 
     async def test_cancellation_kills_process(self):
         proc = FakeProcess()

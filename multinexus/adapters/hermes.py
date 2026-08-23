@@ -3,7 +3,7 @@ import shutil
 import logging
 
 from ..models import AgentConfig
-from .base import AdapterResult, AgentAdapter
+from .base import AdapterResult, AgentAdapter, failed_result, timed_out_result
 from .utils import async_subprocess_kwargs, filtered_env, terminate_owned_process_group
 
 log = logging.getLogger(__name__)
@@ -54,7 +54,10 @@ class HermesAdapter(AgentAdapter):
                 **async_subprocess_kwargs(),
             )
         except FileNotFoundError:
-            return AdapterResult(text=f"Hermes CLI not found: {self.config.hermes_bin}")
+            return failed_result(
+                text=f"Hermes CLI not found: {self.config.hermes_bin}",
+                category="unavailable",
+            )
 
         cleanup_attempted = False
 
@@ -69,7 +72,7 @@ class HermesAdapter(AgentAdapter):
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             await cleanup()
-            return AdapterResult(text=f"Hermes timed out after {timeout}s")
+            return timed_out_result(text=f"Hermes timed out after {timeout}s")
         except asyncio.CancelledError:
             await cleanup()
             raise
@@ -88,11 +91,15 @@ class HermesAdapter(AgentAdapter):
                 stdout_text[-1000:],
             )
             detail = stderr_text or stdout_text
-            return AdapterResult(
-                text=f"Hermes CLI failed ({proc.returncode}): {detail[:500]}"
+            return failed_result(
+                text=f"Hermes CLI failed ({proc.returncode}): {detail[:500]}",
+                category="process_error",
             )
 
-        return AdapterResult(text=stdout_text or "(no response)")
+        if not stdout_text:
+            return failed_result(text="(no response)", category="no_response")
+
+        return AdapterResult(text=stdout_text)
 
     async def health_check(self) -> dict:
         found = shutil.which(self.config.hermes_bin)

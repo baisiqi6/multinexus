@@ -5,7 +5,7 @@ import shutil
 from collections.abc import Callable
 
 from ..models import AgentConfig
-from .base import AdapterResult, AgentAdapter
+from .base import AdapterResult, AgentAdapter, failed_result, timed_out_result
 from .utils import async_subprocess_kwargs, filtered_env, terminate_owned_process_group
 
 log = logging.getLogger(__name__)
@@ -93,7 +93,10 @@ class OpenCodeAdapter(AgentAdapter):
                 **async_subprocess_kwargs(),
             )
         except FileNotFoundError:
-            return AdapterResult(text=f"OpenCode CLI not found: {self.config.opencode_bin}")
+            return failed_result(
+                text=f"OpenCode CLI not found: {self.config.opencode_bin}",
+                category="unavailable",
+            )
 
         cleanup_attempted = False
 
@@ -123,7 +126,7 @@ class OpenCodeAdapter(AgentAdapter):
                 now = loop.time()
                 if now >= deadline:
                     await cleanup()
-                    return AdapterResult(text=f"OpenCode timed out after {timeout}s")
+                    return timed_out_result(text=f"OpenCode timed out after {timeout}s")
 
                 assert proc.stdout is not None
                 idle_timeout = (
@@ -136,12 +139,12 @@ class OpenCodeAdapter(AgentAdapter):
                     elapsed = loop.time() - last_activity
                     if not saw_output and elapsed >= self.config.first_byte_timeout:
                         await cleanup()
-                        return AdapterResult(
+                        return timed_out_result(
                             text=f"OpenCode timed out: no output after {self.config.first_byte_timeout}s"
                         )
                     if saw_output and elapsed >= self.config.activity_timeout:
                         await cleanup()
-                        return AdapterResult(
+                        return timed_out_result(
                             text=f"OpenCode timed out: no activity for {self.config.activity_timeout}s"
                         )
                     continue
@@ -202,8 +205,9 @@ class OpenCodeAdapter(AgentAdapter):
                 stderr_text[-1000:],
             )
             detail = stderr_text or f"exit code {proc.returncode}"
-            return AdapterResult(
-                text=f"OpenCode CLI failed ({proc.returncode}): {detail[:500]}"
+            return failed_result(
+                text=f"OpenCode CLI failed ({proc.returncode}): {detail[:500]}",
+                category="process_error",
             )
 
         if (
@@ -227,18 +231,24 @@ class OpenCodeAdapter(AgentAdapter):
             )
 
         if not response_parts and proc.returncode == 0:
-            return AdapterResult(
+            return failed_result(
                 text=(
                     "OpenCode returned no text"
                     f" (events={','.join(sorted(event_types_seen)) or 'none'})"
                 ),
+                category="no_response",
                 session_id=session_id,
             )
 
-        return AdapterResult(
-            text="\n".join(response_parts).strip() or "(no response)",
-            session_id=session_id,
-        )
+        joined = "\n".join(response_parts).strip()
+        if not joined:
+            return failed_result(
+                text="(no response)",
+                category="no_response",
+                session_id=session_id,
+            )
+
+        return AdapterResult(text=joined, session_id=session_id)
 
     async def health_check(self) -> dict:
         found = shutil.which(self.config.opencode_bin)
