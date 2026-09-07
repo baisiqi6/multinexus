@@ -278,6 +278,48 @@ class TestDiscordResolveChannelWorkspace(unittest.TestCase):
                 platform="discord", channel_id=500
             ))
 
+    def test_managed_runtime_allowance_uses_coordinate_not_static_channels(self):
+        config = _make_config(agentd_mode=True, channels=[100])
+        client = self._make_client(config)
+        client._coordinate_client = MagicMock()
+        client._coordinate_client.resolve_channel_workspace = AsyncMock(
+            return_value="dynamic-workspace"
+        )
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 500
+
+        allowed = _run(client._is_runtime_channel_allowed(channel))
+
+        self.assertTrue(allowed)
+        client._coordinate_client.resolve_channel_workspace.assert_awaited_once_with(
+            platform="discord", channel_id="500"
+        )
+
+    def test_managed_runtime_allowance_fails_closed_on_unbound_or_error(self):
+        config = _make_config(agentd_mode=True, channels=[500])
+        client = self._make_client(config)
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 500
+        client._coordinate_client = MagicMock()
+        client._coordinate_client.resolve_channel_workspace = AsyncMock(return_value=None)
+        self.assertFalse(_run(client._is_runtime_channel_allowed(channel)))
+
+        client._coordinate_client.resolve_channel_workspace = AsyncMock(
+            side_effect=CoordinateRuntimeError("unavailable")
+        )
+        self.assertFalse(_run(client._is_runtime_channel_allowed(channel)))
+
+    def test_legacy_runtime_allowance_keeps_static_channel_contract(self):
+        config = _make_config(agentd_mode=False, channels=[100])
+        client = self._make_client(config)
+        configured = MagicMock(spec=discord.TextChannel)
+        configured.id = 100
+        dynamic = MagicMock(spec=discord.TextChannel)
+        dynamic.id = 500
+
+        self.assertTrue(_run(client._is_runtime_channel_allowed(configured)))
+        self.assertFalse(_run(client._is_runtime_channel_allowed(dynamic)))
+
 
 class TestDiscordOnMessageChannelBinding(unittest.TestCase):
     def _make_client(self, config):
@@ -355,6 +397,46 @@ class TestDiscordOnMessageChannelBinding(unittest.TestCase):
         submit_kwargs = client._coordinate_client.submit_request.await_args.kwargs
         origin = submit_kwargs["origin_json"]
         self.assertEqual(origin["legacy_scope_ids"], [])
+
+    def test_managed_bound_channel_bypasses_stale_static_allowlist(self):
+        config = _make_config(agentd_mode=True, channels=[100])
+        client = self._make_client(config)
+        client._coordinate_client = MagicMock()
+        client._coordinate_client.resolve_channel_workspace = AsyncMock(
+            return_value="dynamic-workspace"
+        )
+        client._coordinate_client.submit_request = AsyncMock(
+            return_value={"result": {"job": {"id": "request:dynamic"}}}
+        )
+        client._coordinate_client.wait_for_job_result = AsyncMock(
+            return_value={
+                "id": "request:dynamic",
+                "status": "done",
+                "result": {"response_text": "dynamic reply"},
+            }
+        )
+        msg = _make_message(content="<@111> hello", channel_id=500)
+        msg.channel.send = AsyncMock()
+
+        _run(client.on_message(msg))
+
+        client._coordinate_client.submit_request.assert_awaited_once()
+        call_kwargs = client.context_store.record_message.call_args.kwargs
+        self.assertEqual(
+            call_kwargs["channel_id"],
+            workspace_channel_context_scope("dynamic-workspace", "discord", 500),
+        )
+
+    def test_legacy_channel_outside_static_allowlist_remains_blocked(self):
+        config = _make_config(agentd_mode=False, channels=[100])
+        client = self._make_client(config)
+        msg = _make_message(content="<@111> hello", channel_id=500)
+        msg.channel.send = AsyncMock()
+
+        _run(client.on_message(msg))
+
+        client.context_store.record_message.assert_not_called()
+        client.adapter.call.assert_not_called()
 
     def test_legacy_human_message_unchanged(self):
         config = _make_config(agentd_mode=False)
@@ -743,7 +825,7 @@ class TestKookChannelBinding(unittest.TestCase):
             return_value={
                 "id": "request:kook",
                 "status": "done",
-                "result_json": '{"response_text":"kook reply"}',
+                "result": {"response_text": "kook reply"},
             }
         )
         bridge.send_channel_message = AsyncMock()
@@ -769,6 +851,13 @@ class TestKookChannelBinding(unittest.TestCase):
 
         submit_kwargs = bridge._coordinate_client.submit_request.await_args.kwargs
         self.assertEqual(submit_kwargs["workspace_id"], "multinexus")
+        self.assertEqual(submit_kwargs["reply_json"]["platform"], "none")
+        self.assertTrue(
+            any(
+                len(call.args) >= 2 and call.args[1] == "kook reply"
+                for call in bridge.send_channel_message.await_args_list
+            )
+        )
         origin = submit_kwargs["origin_json"]
         self.assertEqual(
             origin["session_scope_id"],

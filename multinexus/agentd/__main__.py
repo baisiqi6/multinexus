@@ -14,6 +14,7 @@ import sys
 
 from ..config import load_config
 from .coordinate_client import (
+    CoordinateContractError,
     CoordinateRuntimeError,
     normalize_claim_reap_policy,
     normalize_recovery_reason,
@@ -109,6 +110,22 @@ def main(argv: list[str] | None = None) -> None:
         loop.add_signal_handler(signal.SIGTERM, _shutdown)
 
     try:
+        try:
+            loop.run_until_complete(
+                worker.verify_coordinate_contract(recoverable=args.recoverable)
+            )
+        except CoordinateContractError as exc:
+            log.critical("Coordinate runtime contract mismatch: %s", exc)
+            raise SystemExit(2)
+        except CoordinateRuntimeError as exc:
+            # Do not enter the claim loop without a verified server/client
+            # pairing.  A supervisor may restart this process, but this
+            # instance must never claim against an unknown contract.
+            log.critical(
+                "Coordinate runtime contract probe unavailable; refusing to claim: %s",
+                exc,
+            )
+            raise SystemExit(2)
         log.info(
             "agentd worker starting: agent=%s recoverable=%s reap_mode=%s",
             config.id,

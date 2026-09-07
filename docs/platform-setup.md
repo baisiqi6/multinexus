@@ -128,12 +128,12 @@ work_dir = "."
 claude_bin = "claude"
 ```
 
-Coordinate-managed 运行需要另行设置 `coordinator_cli_path` 和 `agentd_mode = true`，并在每个 agent 主机上运行 `python -m multinexus.agentd --agent <id>`。
+Coordinate-managed 运行需要 Coordinate v0.4.0 的契约能力、`agentd_mode = true`，并在每个 agent 主机上运行 `python -m multinexus.agentd --agent <id>`。默认 CLI 设置 `coordinator_cli_path`；可选 HTTP 见下文。
 
 ### Coordinate-managed 本地 no-send 验证
 
 先按 [Coordinate README](https://github.com/baisiqi6/coordinate) 在本机完成 fresh install。
-Coordinate-managed profile 的三个关键值是：
+以下默认 CLI transport 的三个关键值是：
 
 - `agentd_mode = true`；
 - `coordinator_cli_path`：本机安装生成的 `coordinate` console script 绝对路径；
@@ -434,3 +434,27 @@ PRIVATE_DB_PATH=/home/you/.private/multinexus/private.db
 
 回退链需要配置多个 agent 并在线。
 检查 `agents`（文本命令）以查看哪些 agent 可用。
+
+## Runtime HTTP 与 v0.2.0 升级
+
+先安装 Coordinate v0.4.0；使用 HTTP 时按 Coordinate 文档安装 `runtime-http` extra，配置 listener 与 client role。agentd 启动会校验 `contract_version=1` 与 `claim_fencing`、`agent_reconcile`、`managed_lease`、`terminal_report` 四项能力。版本字符串本身不构成能力证明；旧服务或缺少能力时启动失败且不会 claim。operator recoverable claim 仍只支持具备对应能力的 CLI。
+
+在本机 TOML `[defaults]` 或单个 agent 小节中配置：
+
+```toml
+agentd_mode = true
+coordinate_transport = "http"
+coordinate_http_base_url = "http://127.0.0.1:8765"
+coordinate_http_client_id = "<client-id>"
+coordinate_http_token_file = "/absolute/private/path/runtime-token"
+```
+
+HTTP URL 必须是数字 loopback 地址且包含端口，不能用 DNS、远程地址、userinfo、query 或非根路径。跨主机使用经过认证的 SSH local-forward。桥与 agentd 需要各自对应的 bridge/agentd role credential，不应共用一个身份。token 放在显式绝对路径的普通非 symlink 文件中；POSIX 不得 world-readable 或 group/world-writable，Windows 校验可信账户 DACL。不会把 token 放在 TOML、argv 或日志中。HTTP client 不读取服务器 DB；CLI 使用本机绝对 `coordinator_db_path`，同一进程只使用一个 transport。
+
+服务管理器可以设置 `MULTINEXUS_COORDINATE_TRANSPORT`、`MULTINEXUS_COORDINATE_HTTP_BASE_URL`、`MULTINEXUS_COORDINATE_HTTP_CLIENT_ID`、`MULTINEXUS_COORDINATE_HTTP_TOKEN_FILE`。这四项只接受真实 process environment 覆盖，共享 `.env` 不具备该 authority。ZCode 的三个 service override 见 [权限说明](zcode-permissions.md)。
+
+升级次序：先验证 Coordinate 能力和 managed Discord channel binding；停止访问本地 context/session DB 的进程并备份 SQLite；升级 MultiNexus；以原配置的单一 transport 启动 agentd，再启动 bridge。managed Discord 消息和 slash-command 准入使用 Coordinate binding，standalone 仍使用静态 `channels`，`allowed_user_ids` 仍限制 Operator 命令。
+
+首次打开本地库保留旧行并新增 sessions 的 `context_generation`、`context_cursor_order_token`、`context_cursor_message_id` 和 context 的 `runtime_reply_outbox`。cursor 身份不完整时回退完整历史，不猜测增量已消费。旧版不理解 cursor/outbox，回退前应核对并处理待投递记录，不能保证直接降级不丢失或重复消息；恢复升级前备份会丢弃之后的记录。不要手工把 outbox 标记为已投递。
+
+可选 `MULTINEXUS_AGENTD_HEALTH_FILE` 输出本地健康 JSON（父目录和权限由 Operator 配置）；它描述进程观测，不能替代 Coordinate job/lease authority。`latched` 表示停止新 claim，不能仅靠进程 PID 宣称 ready。权限不确定时先核对 job/lease 和旧进程，再按 Coordinate recovery 契约处理。

@@ -13,10 +13,16 @@ from collections import deque
 
 from khl import Bot, Message, api
 
-from ..agentd.coordinate_client import CoordinateRuntimeClient, CoordinateRuntimeError
-from ..context.prompt import build_agent_prompt
+from ..agentd.coordinate_client import (
+    CoordinateHttpRuntimeClient,
+    CoordinateRuntimeClient,
+    CoordinateRuntimeError,
+    make_coordinate_runtime_client,
+)
+from ..context.prompt import build_agent_prompt, build_agent_prompt_with_context
 from ..context.store import ChatContextStore
 from ..models import AgentConfig
+from ..protocol import runtime_job_response_text
 from ..sessions.scope import (
     workspace_channel_context_scope,
     workspace_channel_session_scope,
@@ -66,20 +72,15 @@ class KookBridge:
         self.seen_message_order: deque[str] = deque()
         self.poll_error_keys: set[str] = set()
         self.poll_error_last_logged: dict[str, float] = {}
+        self._reply_recovery_task: asyncio.Task | None = None
 
         # Coordinate runtime integration
-        self._coordinate_client: CoordinateRuntimeClient | None = None
+        self._coordinate_client: CoordinateRuntimeClient | CoordinateHttpRuntimeClient | None = None
 
         if config.agentd_mode:
-            if not config.coordinator_cli_path:
-                raise SystemExit(
-                    "agentd_mode requires coordinator_cli_path. "
-                    "Set it in agents.toml or the [defaults] section."
-                )
-            self._coordinate_client = CoordinateRuntimeClient(
-                cli_path=config.coordinator_cli_path,
-                db_path=config.coordinator_db_path,
-            )
+            # Single transport factory: cli (default) or http; fail closed on
+            # unknown transport or missing fields.
+            self._coordinate_client = make_coordinate_runtime_client(config)
         else:
             from ..adapters.factory import make_adapter
             self._adapter = make_adapter(config)
@@ -105,6 +106,7 @@ class KookBridge:
                 self.config.id, me.id, sorted(self.bot_role_ids), self.config.agentd_mode,
             )
             self.bot_role_ids = await self._discover_bot_role_ids(_bot)
+            self._start_reply_recovery()
             asyncio.create_task(self._poll_messages(_bot))
 
         @self.bot.on_message()
@@ -297,20 +299,35 @@ class KookBridge:
         await self.send_channel_message(channel_id, "思考中...", quote=message_id)
 
         # Build prompt using workspace-qualified context scope when managed.
+        context_envelope = None
         try:
-            prompt = build_agent_prompt(
-                context_store=self.context_store,
-                config=self.config,
-                bot_id=None,
-                channel_id=context_scope,
-                message_id=message_id,
-                current_text=text,
-            )
+            if self.config.agentd_mode:
+                prompt, context_envelope = build_agent_prompt_with_context(
+                    context_store=self.context_store,
+                    config=self.config,
+                    bot_id=self.bot_id,
+                    channel_id=context_scope,
+                    message_id=message_id,
+                    current_text=text,
+                    scope_id=context_scope,
+                    session_scope_id=session_scope_id,
+                    recipient={"id": self.config.id, "name": self.config.display_name},
+                )
+            else:
+                prompt = build_agent_prompt(
+                    context_store=self.context_store,
+                    config=self.config,
+                    bot_id=self.bot_id,
+                    channel_id=context_scope,
+                    message_id=message_id,
+                    current_text=text,
+                )
         except Exception:
             log.exception("Prompt build failed: agent=%s", self.config.id)
             return
 
         # Submit to coordinate or call adapter directly
+        managed_job_id: str | None = None
         if self.config.agentd_mode and self._coordinate_client:
             origin = {
                 "platform": "kook",
@@ -320,8 +337,12 @@ class KookBridge:
                 "session_scope_id": session_scope_id,
                 "legacy_scope_ids": [],
             }
+            if isinstance(context_envelope, dict):
+                origin["context"] = context_envelope
             reply_json = {
-                "platform": "kook",
+                # The bridge is the visible reply owner, matching Discord.
+                # Do not also create a Coordinate delivery for the same result.
+                "platform": "none",
                 "destination": channel_id,
                 "quote_message_id": message_id,
             }
@@ -345,6 +366,15 @@ class KookBridge:
             job_id = job_data.get("id") if job_data else None
             if not job_id:
                 return
+            managed_job_id = job_id
+
+            self.context_store.record_runtime_reply(
+                job_id=job_id,
+                workspace_id=resolved_workspace,
+                platform="kook",
+                destination_id=channel_id,
+                quote_message_id=message_id,
+            )
 
             # Poll coordinate until agentd processes the job
             completed = await self._coordinate_client.wait_for_job_result(
@@ -355,21 +385,9 @@ class KookBridge:
 
             if completed is None:
                 reply = "Agent timed out (no response from agentd)."
+                self._start_reply_recovery()
             else:
-                result_json_str = completed.get("result_json")
-                if result_json_str:
-                    try:
-                        import json
-                        result_data = json.loads(result_json_str)
-                        reply = (
-                            result_data.get("response_text")
-                            or result_data.get("text")
-                            or "(empty response)"
-                        )
-                    except (json.JSONDecodeError, TypeError):
-                        reply = "(invalid result)"
-                else:
-                    reply = f"Job {completed.get('status', 'unknown')}"
+                reply = runtime_job_response_text(completed)
         else:
             try:
                 reply = await self._adapter.ask(prompt)
@@ -381,6 +399,54 @@ class KookBridge:
         # Send reply in chunks
         for i in range(0, len(reply), 2000):
             await self.send_channel_message(channel_id, reply[i:i + 2000], quote=message_id)
+        if managed_job_id is not None and completed is not None:
+            self.context_store.mark_runtime_reply_sent(job_id=managed_job_id)
+
+    async def _recover_runtime_replies(self) -> None:
+        """Replay KOOK replies left in the bridge-owned local outbox."""
+        if not self._coordinate_client:
+            return
+        pending = self.context_store.pending_runtime_replies(platform="kook")
+        for item in pending:
+            job_id = item["job_id"]
+            self.context_store.mark_runtime_reply_attempt(
+                job_id=job_id, error_code="recovery_started"
+            )
+            try:
+                completed = await self._coordinate_client.wait_for_job_result(
+                    job_id=job_id,
+                    workspace_id=item["workspace_id"],
+                    timeout=self.config.timeout,
+                )
+                if completed is None:
+                    continue
+                reply = runtime_job_response_text(completed)
+                for offset in range(0, len(reply), 2000):
+                    await self.send_channel_message(
+                        item["destination_id"],
+                        reply[offset : offset + 2000],
+                        quote=item["quote_message_id"] or None,
+                    )
+                self.context_store.mark_runtime_reply_sent(job_id=job_id)
+            except Exception:
+                self.context_store.mark_runtime_reply_attempt(
+                    job_id=job_id, error_code="recovery_failed"
+                )
+                log.warning(
+                    "KOOK runtime reply recovery failed: agent=%s job=%s",
+                    self.config.id,
+                    job_id,
+                    exc_info=True,
+                )
+
+    def _start_reply_recovery(self) -> None:
+        """Schedule one bridge-owned reply replay task at a time."""
+        if not self.config.agentd_mode:
+            return
+        if self._reply_recovery_task is None or self._reply_recovery_task.done():
+            self._reply_recovery_task = asyncio.create_task(
+                self._recover_runtime_replies()
+            )
 
     def _remember_message_id(self, message_id: str) -> None:
         if message_id in self.seen_message_ids:

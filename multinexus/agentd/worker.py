@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import inspect
 import logging
+import sqlite3
 import time
+import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from ..adapters.base import (
@@ -27,11 +31,17 @@ from ..adapters.base import (
     safe_exception_diagnostic,
 )
 from ..adapters.factory import make_adapter
+from ..context.envelope import parse_context_envelope
+from ..context.prompt import delta_prompt, render_envelope
 from ..models import AgentConfig
 from ..sessions.store import SessionStore
 from .coordinate_client import (
-    CoordinateRuntimeClient,
+    CoordinateClaimAuthorityUncertainError,
+    CoordinateContractError,
+    CoordinateClaimReplayConflictError,
+    CoordinateClaimTerminalError,
     CoordinateRuntimeError,
+    make_coordinate_runtime_client,
     normalize_claim_reap_policy,
     normalize_recovery_reason,
 )
@@ -42,6 +52,7 @@ from .execution_lease import (
     ExecutionLeaseV1,
     validate_execution_lease,
 )
+from .health import AgentdHealthProjection
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +64,13 @@ class LeaseLostError(RuntimeError):
 RENEWAL_SAFETY_MARGIN_SECONDS = 5
 
 
+@dataclass
+class _SessionAttempt:
+    # One attempt's observed row. Only our own successful CAS may replace it.
+    snapshot: dict | None
+    writable: bool = True
+
+
 class AgentdWorker:
     """Standalone agentd that claims jobs from coordinate and processes them."""
 
@@ -60,12 +78,34 @@ class AgentdWorker:
         self.config = config
         self.adapter = make_adapter(config)
         self.session_store = SessionStore(config.context_db_path)
-        self.coordinate = CoordinateRuntimeClient(
-            cli_path=config.coordinator_cli_path,
-            db_path=config.coordinator_db_path,
-        )
+        # Single transport factory: cli (default) or http, never both.
+        self.coordinate = make_coordinate_runtime_client(config)
+        self.health = AgentdHealthProjection.from_environment(config.id)
         self._running = False
         self._wake = asyncio.Event()
+        # Optimization eligibility only; the durable cursor remains solely in
+        # SessionStore. A new process must first confirm a full-history turn.
+        self._context_sessions: dict[str, tuple[str, str]] = {}
+
+    async def verify_coordinate_contract(self, *, recoverable: bool = False) -> dict[str, Any]:
+        """Verify the server/client pairing before the worker can claim work."""
+        self.health.write("starting", "contract_probe")
+        get_contract = getattr(self.coordinate, "get_runtime_contract", None)
+        if not callable(get_contract):
+            self.health.write("latched", "contract_mismatch")
+            raise CoordinateContractError(
+                "coordinate runtime client has no contract probe"
+            )
+        try:
+            contract = await get_contract(recoverable=recoverable)
+        except CoordinateContractError:
+            self.health.write("latched", "contract_mismatch")
+            raise
+        except CoordinateRuntimeError:
+            self.health.write("degraded", "contract_probe_unavailable")
+            raise
+        self.health.write("ready")
+        return contract
 
     async def run(
         self,
@@ -110,6 +150,8 @@ class AgentdWorker:
                 )
             normalized_rec_reason = ""
         self._running = True
+        if self.health.state == "stopped":
+            self.health.write("ready")
         if recoverable:
             log.warning(
                 "Agentd worker started in RECOVERY mode: agent=%s reason=%s (will claim timed_out+recoverable jobs)",
@@ -118,6 +160,21 @@ class AgentdWorker:
             )
         else:
             log.info("Agentd worker started: agent=%s", self.config.id)
+        # One stable operation key per logical claim.  It is retained across
+        # an authority-uncertain outcome so a retry can replay the exact
+        # server-side claim instead of creating a second attempt.
+        claim_request_id = uuid.uuid4().hex
+        try:
+            claim_signature = inspect.signature(self.coordinate.claim_job)
+            claim_supports_request_id = (
+                "claim_request_id" in claim_signature.parameters
+                or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in claim_signature.parameters.values()
+                )
+            )
+        except (TypeError, ValueError):
+            claim_supports_request_id = False
         while self._running:
             try:
                 claim_kwargs = {
@@ -126,12 +183,74 @@ class AgentdWorker:
                     "recovery_reason": normalized_rec_reason,
                     "prior_process_stopped": prior_process_stopped,
                 }
+                if claim_supports_request_id:
+                    claim_kwargs["claim_request_id"] = claim_request_id
                 if normalized_mode == "none":
                     claim_kwargs.update(
                         reap_mode=normalized_mode,
                         reap_reason=normalized_reap_reason,
                     )
                 claim_result = await self.coordinate.claim_job(**claim_kwargs)
+            except CoordinateClaimAuthorityUncertainError as exc:
+                # The claim response is uncertain. Do not run the adapter until
+                # the same fenced operation key gets an authoritative outcome.
+                log.critical(
+                    "Claim authority uncertain for agent %s: %s. "
+                    "Pausing claims while authority is reconciled; process stays alive.",
+                    self.config.id,
+                    exc,
+                )
+                if not claim_supports_request_id:
+                    self.health.write("latched", "claim_fencing_unavailable")
+                    log.critical(
+                        "Claim request fencing unavailable for agent %s; staying latched",
+                        self.config.id,
+                    )
+                    while self._running:
+                        await self._wake.wait()
+                        self._wake.clear()
+                    break
+                # A sent claim may already own a lease.  Reconcile through the
+                # agent-scoped read path before allowing another claim; never
+                # treat transport recovery alone as proof that the claim did
+                # not commit.
+                if await self._reconcile_claim_authority(poll_interval):
+                    log.warning(
+                        "Claim authority probe complete for agent %s; retrying same claim key",
+                        self.config.id,
+                    )
+                    continue
+                log.critical(
+                    "Claim authority reconcile unavailable for agent %s; staying latched",
+                    self.config.id,
+                )
+                self.health.write("latched", "claim_authority_uncertain")
+                while self._running:
+                    await self._wake.wait()
+                    self._wake.clear()
+                break
+            except CoordinateClaimReplayConflictError as exc:
+                self.health.write("latched", "claim_replay_conflict")
+                log.critical(
+                    "Claim replay conflict for agent %s: %s; staying fail-closed",
+                    self.config.id,
+                    exc,
+                )
+                while self._running:
+                    await self._wake.wait()
+                    self._wake.clear()
+                break
+            except CoordinateClaimTerminalError as exc:
+                self.health.write("latched", "claim_terminal_rejection")
+                log.critical(
+                    "Claim request rejected for agent %s: %s; staying fail-closed",
+                    self.config.id,
+                    exc,
+                )
+                while self._running:
+                    await self._wake.wait()
+                    self._wake.clear()
+                break
             except CoordinateRuntimeError as exc:
                 log.error(
                     "Coordinate claim error for agent %s: %s", self.config.id, exc
@@ -146,6 +265,7 @@ class AgentdWorker:
 
             if not isinstance(claim_result, dict) or not claim_result.get("claimed"):
                 self._log_claim_blocker(claim_result)
+                claim_request_id = uuid.uuid4().hex
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=poll_interval)
                 except asyncio.TimeoutError:
@@ -153,8 +273,72 @@ class AgentdWorker:
                 self._wake.clear()
                 continue
 
+            claim_request_id = uuid.uuid4().hex
+            self.health.write("processing")
             await self._process_job(claim_result)
+            if self._running:
+                self.health.write("ready")
         log.info("Agentd worker stopped: agent=%s", self.config.id)
+
+    async def _reconcile_claim_authority(self, poll_interval: float) -> bool:
+        """Wait for a successful, agent-scoped no-active-lease proof.
+
+        The probe is diagnostic once claim-side fencing is available. A
+        successful, structurally valid snapshot leaves the operation key
+        unchanged so the caller can replay that same key; transport or
+        malformed responses keep the worker latched. The bounded backoff
+        avoids a hot loop while preserving an immediate stop() wake-up.
+        Older clients without fencing stay latched safely.
+        """
+        reconcile = getattr(self.coordinate, "reconcile_agent", None)
+        if not callable(reconcile):
+            log.critical(
+                "No claim-authority reconcile capability for agent %s; staying latched",
+                self.config.id,
+            )
+            while self._running:
+                await self._wake.wait()
+                self._wake.clear()
+            return False
+
+        delay = max(float(poll_interval), 0.1)
+        try:
+            snapshot = await reconcile(agent_id=self.config.id)
+        except CoordinateRuntimeError as exc:
+            log.error(
+                "Claim-authority reconcile failed for agent %s: %s",
+                self.config.id,
+                exc,
+            )
+            return False
+        except Exception as exc:
+            log.error(
+                "Claim-authority reconcile unexpected failure for agent %s: %s",
+                self.config.id,
+                type(exc).__name__,
+            )
+            return False
+        else:
+            active_leases = snapshot.get("active_leases") if isinstance(snapshot, dict) else None
+            if isinstance(active_leases, list):
+                log.info(
+                    "Claim-authority reconcile observed %d active lease(s) for agent %s; retrying same key",
+                    len(active_leases),
+                    self.config.id,
+                )
+            else:
+                log.error(
+                    "Claim-authority reconcile returned malformed snapshot for agent %s",
+                    self.config.id,
+                )
+                return False
+
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        self._wake.clear()
+        return self._running
 
     @staticmethod
     def _sanitize_blocked_field(value: str) -> str:
@@ -266,6 +450,10 @@ class AgentdWorker:
 
         binding_field_present = "executor_binding" in payload
         binding_snapshot = payload.get("executor_binding")
+        context_envelope = None
+        origin = payload.get("origin")
+        if isinstance(origin, dict):
+            context_envelope = parse_context_envelope(origin.get("context"))
 
         if lease is not None:
             # Managed claim: a valid lease requires a valid typed binding.
@@ -420,6 +608,32 @@ class AgentdWorker:
         session_scope_id = ctx.session_scope_id
         legacy_scope_ids = ctx.legacy_scope_ids
         work_dir = ctx.cwd
+        if context_envelope is not None and (
+            context_envelope.session_scope_id != session_scope_id
+            or not context_envelope.scope_id.startswith(f"workspace:{ctx.workspace_id}:")
+            or context_envelope.current_message_id != str(origin.get("message_id", ""))
+        ):
+            context_envelope = None
+        if context_envelope is not None and render_envelope(
+            context_envelope.to_dict(), self.config
+        ) != prompt:
+            context_envelope = None
+        try:
+            cursor_before = self.session_store.get(
+                scope_id=session_scope_id, agent_id=self.config.id, include_inactive=True
+            )
+            session_attempt = _SessionAttempt(cursor_before)
+        except sqlite3.Error:
+            # A cursor store outage must never make execution unsafe or
+            # incomplete: discard the optimization envelope and retain the
+            # already-rendered bounded full prompt.
+            log.warning(
+                "SessionStore unavailable for agent=%s scope=%s; using full context",
+                self.config.id,
+                session_scope_id,
+            )
+            session_attempt = _SessionAttempt(None, writable=False)
+            context_envelope = None
         recovery_session_id = self._recovery_session_id(job)
         progress_callback, progress_tasks, progress_state = (
             self._make_coordinate_progress_callback(
@@ -457,6 +671,8 @@ class AgentdWorker:
                     work_dir,
                     on_progress=progress_callback,
                     recovery_session_id=recovery_session_id,
+                    context_envelope=context_envelope,
+                    session_attempt=session_attempt,
                 )
             )
             coros = [provider_task]
@@ -529,15 +745,6 @@ class AgentdWorker:
 
         duration_ms = int((time.time() - start) * 1000)
 
-        if result.session_id and session_scope_id:
-            self.session_store.upsert(
-                scope_id=session_scope_id,
-                agent_id=self.config.id,
-                adapter=self.config.adapter,
-                session_id=result.session_id,
-                work_dir=work_dir,
-            )
-
         outcome = result.effective_outcome()
         status = self._status_for_result(result)
         # Delivery decision reads the machine outcome; the legacy sentinel is
@@ -560,6 +767,8 @@ class AgentdWorker:
             "worktree_path": ctx.worktree_path,
             "session_scope_id": ctx.session_scope_id,
             "outcome": outcome,
+            "attempt_token": trusted_attempt_token,
+            "lease_id": trusted_lease_id,
         }
         if no_response:
             result_json["error"] = NO_RESPONSE_SENTINEL
@@ -578,8 +787,10 @@ class AgentdWorker:
             }
         if result.metadata.get("provider_evidence"):
             result_json["provider_evidence"] = result.metadata["provider_evidence"]
+        if result.metadata.get("usage_evidence"):
+            result_json["usage_evidence"] = result.metadata["usage_evidence"]
 
-        await self.coordinate.report_job(
+        receipt = await self.coordinate.report_job(
             job_id=trusted_job_id,
             agent_id=self.config.id,
             status=status,
@@ -587,12 +798,98 @@ class AgentdWorker:
             attempt_token=trusted_attempt_token,
             lease_id=trusted_lease_id,
         )
+        if outcome == OUTCOME_SUCCESS and status == "done" and result.session_id:
+            if self._reported_success_matches(
+                receipt, job_id=trusted_job_id, attempt_token=trusted_attempt_token,
+                result_json=result_json,
+            ):
+                self._persist_session_result(
+                    session_attempt, session_scope_id=session_scope_id,
+                    work_dir=work_dir, session_id=result.session_id,
+                    context_envelope=context_envelope,
+                )
+            else:
+                log.warning("Unconfirmed terminal receipt for job %s; session unchanged", trusted_job_id)
         log.info(
             "Job %s complete: status=%s duration=%dms",
             trusted_job_id,
             status,
             duration_ms,
         )
+
+    def _reported_success_matches(
+        self, receipt: Any, *, job_id: str, attempt_token: int | None, result_json: dict
+    ) -> bool:
+        """Accept applied results and exact terminal replays, never arbitrary 200s."""
+        data = receipt.get("result") if isinstance(receipt, dict) else None
+        job = data.get("job") if isinstance(data, dict) else None
+        if not isinstance(job, dict) or not (
+            job.get("id") == job_id
+            and job.get("assigned_agent") == self.config.id
+            and job.get("status") == "done"
+            and type(job.get("attempt_count")) is int
+            and type(attempt_token) is int
+            and job["attempt_count"] == attempt_token
+        ):
+            return False
+        stored = job.get("result")
+        if not isinstance(stored, dict):
+            return False
+        # Coordinate normalizes usage into a bounded summary. The remaining
+        # submitted result, including exact attempt/lease evidence, is stable.
+        return all(
+            key in stored and stored[key] == value
+            for key, value in result_json.items() if key != "usage_evidence"
+        )
+
+    def _persist_session_result(
+        self, attempt: _SessionAttempt, *, session_scope_id: str, work_dir: str,
+        session_id: str, context_envelope,
+    ) -> None:
+        if not attempt.writable or not session_scope_id:
+            return
+        try:
+            persisted = self.session_store.upsert(
+                scope_id=session_scope_id, agent_id=self.config.id,
+                adapter=self.config.adapter, session_id=session_id, work_dir=work_dir,
+                context_generation=context_envelope.generation if context_envelope else None,
+                expected_session=attempt.snapshot,
+            )
+            if persisted is None:
+                log.warning("Session CAS lost for agent=%s scope=%s", self.config.id, session_scope_id)
+                return
+            if context_envelope is not None:
+                advanced = self.session_store.advance_context_cursor(
+                    scope_id=session_scope_id, agent_id=self.config.id, session_id=session_id,
+                    context_generation=context_envelope.generation,
+                    expected_cursor_order_token=persisted["context_cursor_order_token"],
+                    expected_cursor_message_id=persisted["context_cursor_message_id"],
+                    cursor_order_token=context_envelope.current_order_token,
+                    cursor_message_id=context_envelope.current_message_id,
+                    expected_session=persisted,
+                )
+                if advanced:
+                    self._context_sessions[session_scope_id] = (session_id, context_envelope.generation)
+        except (sqlite3.Error, ValueError):
+            self._context_sessions.pop(session_scope_id, None)
+            log.warning("Session checkpoint unavailable for agent=%s scope=%s", self.config.id, session_scope_id)
+
+    def _retire_session(self, existing: dict, attempt: _SessionAttempt, scope: str) -> bool:
+        """Only this attempt's own retirement authorizes its fresh fallback."""
+        self._context_sessions.pop(scope, None)
+        try:
+            retired = self.session_store.mark_stale(
+                scope_id=existing["scope_id"], agent_id=self.config.id,
+                expected_session=existing,
+            )
+        except sqlite3.Error:
+            retired = None
+        if retired is None:
+            attempt.writable = False
+            return False
+        if existing["scope_id"] == scope:
+            attempt.snapshot = retired
+        return True
 
     async def _renewal_supervisor(
         self,
@@ -708,14 +1005,8 @@ class AgentdWorker:
                 return
             state.update({k: v for k, v in progress.items() if v})
             session_id = progress.get("session_id", "")
-            if session_id and session_scope_id:
-                self.session_store.upsert(
-                    scope_id=session_scope_id,
-                    agent_id=self.config.id,
-                    adapter=self.config.adapter,
-                    session_id=session_id,
-                    work_dir=work_dir,
-                )
+            # Coordinate owns durable in-flight session recovery. SessionStore
+            # is updated only after the matching terminal receipt is accepted.
             now = time.monotonic()
             should_send = bool(session_id and session_id != sent.get("session_id"))
             should_send = should_send or (now - float(sent.get("at", 0.0)) >= 10.0)
@@ -806,6 +1097,8 @@ class AgentdWorker:
         *,
         on_progress=None,
         recovery_session_id: str = "",
+        context_envelope=None,
+        session_attempt: _SessionAttempt | None = None,
     ) -> AdapterResult:
         """Check session store for existing session; resume if found, else fresh call."""
         if not session_scope_id:
@@ -823,10 +1116,25 @@ class AgentdWorker:
                 on_progress=on_progress,
             )
 
-        existing = self.session_store.get_first_active(
-            scope_ids=(session_scope_id, *legacy_scope_ids),
-            agent_id=self.config.id,
-        )
+        try:
+            if session_attempt is None:
+                session_attempt = _SessionAttempt(self.session_store.get(
+                    scope_id=session_scope_id, agent_id=self.config.id, include_inactive=True
+                ))
+            existing = session_attempt.snapshot
+            if existing is not None and existing["status"] != "active":
+                existing = None
+            if existing is None and session_attempt.writable:
+                existing = self.session_store.get_first_active(
+                    scope_ids=legacy_scope_ids, agent_id=self.config.id,
+                )
+        except sqlite3.Error:
+            if session_attempt is None:
+                session_attempt = _SessionAttempt(None, writable=False)
+            else:
+                session_attempt.writable = False
+            existing = None
+            log.warning("SessionStore unavailable for agent=%s; using full prompt", self.config.id)
 
         if existing:
             current_work_dir = work_dir
@@ -840,10 +1148,7 @@ class AgentdWorker:
                     existing["work_dir"],
                     current_work_dir,
                 )
-                self.session_store.mark_stale(
-                    scope_id=existing["scope_id"],
-                    agent_id=self.config.id,
-                )
+                self._retire_session(existing, session_attempt, session_scope_id)
                 existing = None
 
         # recovery_session_id present means always fail-closed recoverable
@@ -859,6 +1164,22 @@ class AgentdWorker:
             )
 
         if existing:
+            effective_prompt = prompt
+            if context_envelope is not None:
+                if (
+                    self._context_sessions.get(session_scope_id)
+                    == (existing["session_id"], context_envelope.generation)
+                    and existing["scope_id"] == session_scope_id
+                    and existing.get("context_generation") == context_envelope.generation
+                    and existing.get("context_cursor_order_token")
+                    and existing.get("context_cursor_message_id")
+                ):
+                    effective_prompt = delta_prompt(
+                        context_envelope.to_dict(),
+                        existing["context_cursor_order_token"],
+                        existing["context_cursor_message_id"],
+                        self.config,
+                    ) or prompt
             log.info(
                 "Resuming session %s for scope=%s",
                 existing["session_id"],
@@ -866,7 +1187,7 @@ class AgentdWorker:
             )
             result: AdapterResult = await self.adapter.resume(
                 existing["session_id"],
-                prompt,
+                effective_prompt,
                 timeout=self.config.timeout,
                 work_dir=work_dir,
                 on_progress=on_progress,
@@ -885,11 +1206,8 @@ class AgentdWorker:
                     existing["session_id"],
                     allow_fresh_fallback,
                 )
-                self.session_store.mark_stale(
-                    scope_id=existing["scope_id"],
-                    agent_id=self.config.id,
-                )
-                if allow_fresh_fallback and not is_internal_error:
+                retired = self._retire_session(existing, session_attempt, session_scope_id)
+                if retired and allow_fresh_fallback and not is_internal_error:
                     result = await self.adapter.call(
                         prompt,
                         timeout=self.config.timeout,
@@ -948,6 +1266,7 @@ class AgentdWorker:
     def stop(self) -> None:
         self._running = False
         self._wake.set()
+        self.health.write("stopped", self.health.reason_code or "shutdown")
 
     @classmethod
     def _is_error(cls, text: str) -> bool:

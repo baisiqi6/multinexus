@@ -25,6 +25,8 @@ def _config(**overrides):
         "token": "fake-token",
         "adapter": "claude",
         "context_db_path": str(Path(mkdtemp()) / "test.sqlite3"),
+        "coordinator_cli_path": "/bin/true",
+        "coordinator_db_path": "/tmp/test.db",
     }
     defaults.update(overrides)
     return AgentConfig(**defaults)
@@ -592,6 +594,7 @@ class CliRecoveryArgumentTests(unittest.TestCase):
         mock_worker = MagicMock()
         mock_worker.run = AsyncMock()
         mock_worker.stop = MagicMock()
+        mock_worker.verify_coordinate_contract = AsyncMock()
 
         with (
             patch(
@@ -618,6 +621,29 @@ class CliRecoveryArgumentTests(unittest.TestCase):
             prior_process_stopped=True,
         )
 
+    def test_contract_probe_unavailable_refuses_claim_loop(self):
+        from multinexus.agentd.__main__ import main
+        from multinexus.agentd.coordinate_client import CoordinateRuntimeError
+
+        mock_config = MagicMock()
+        mock_config.id = "test-agent"
+        mock_worker = MagicMock()
+        mock_worker.run = AsyncMock()
+        mock_worker.stop = MagicMock()
+        mock_worker.verify_coordinate_contract = AsyncMock(
+            side_effect=CoordinateRuntimeError("probe unavailable")
+        )
+
+        with (
+            patch("multinexus.agentd.__main__.load_config", return_value=mock_config),
+            patch("multinexus.agentd.__main__.AgentdWorker", return_value=mock_worker),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                main(["--agent", "test-agent"])
+
+        self.assertEqual(raised.exception.code, 2)
+        mock_worker.run.assert_not_awaited()
+
 
 class CliLogLevelArgumentTests(unittest.TestCase):
     """E) CLI --log-level must be parsed before basicConfig; default INFO."""
@@ -630,6 +656,7 @@ class CliLogLevelArgumentTests(unittest.TestCase):
         mock_worker = MagicMock()
         mock_worker.run = AsyncMock()
         mock_worker.stop = MagicMock()
+        mock_worker.verify_coordinate_contract = AsyncMock()
 
         with (
             patch("multinexus.agentd.__main__.load_config", return_value=mock_config),
@@ -649,6 +676,7 @@ class CliLogLevelArgumentTests(unittest.TestCase):
         mock_worker = MagicMock()
         mock_worker.run = AsyncMock()
         mock_worker.stop = MagicMock()
+        mock_worker.verify_coordinate_contract = AsyncMock()
 
         with (
             patch("multinexus.agentd.__main__.load_config", return_value=mock_config),
@@ -675,6 +703,7 @@ class CliLogLevelArgumentTests(unittest.TestCase):
         mock_worker = MagicMock()
         mock_worker.run = AsyncMock()
         mock_worker.stop = MagicMock()
+        mock_worker.verify_coordinate_contract = AsyncMock()
 
         launchd_argv = [
             "/home/example/multinexus/.venv/bin/python",

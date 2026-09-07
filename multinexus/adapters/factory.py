@@ -8,6 +8,7 @@ from .hermes import HermesAdapter
 from .omp import OmpAdapter
 from .opencode import OpenCodeAdapter
 from .qoder import QoderAdapter
+from .zcode import ZCodeAdapter
 
 
 def make_adapter(config: AgentConfig) -> AgentAdapter:
@@ -28,6 +29,8 @@ def make_adapter(config: AgentConfig) -> AgentAdapter:
         return OpenCodeAdapter(config)
     if adapter == "qoder":
         return QoderAdapter(config)
+    if adapter == "zcode":
+        return ZCodeAdapter(config)
     raise SystemExit(
-        f"Unsupported adapter: {config.adapter}. Available: acp, claude, codex, grok, hermes, omp, opencode, qoder."
+        f"Unsupported adapter: {config.adapter}. Available: acp, claude, codex, grok, hermes, omp, opencode, qoder, zcode."
     )

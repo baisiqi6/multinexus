@@ -12,6 +12,7 @@ import collections.abc
 import logging
 import os
 import time
+from typing import Any, Awaitable, Callable
 
 import discord
 from discord import app_commands
@@ -24,17 +25,28 @@ from .adapters.base import (
     safe_exception_diagnostic,
 )
 from .adapters.factory import make_adapter
-from .agentd.coordinate_client import CoordinateRuntimeClient, CoordinateRuntimeError
+from .agentd.coordinate_client import (
+    CoordinateHttpRuntimeClient,
+    CoordinateRuntimeClient,
+    CoordinateRuntimeError,
+    make_coordinate_runtime_client,
+)
 from .config import load_config
 from .coordinator_handoff import CoordinatorHandoffMixin
-from .context.prompt import build_agent_prompt
+from .context.prompt import build_agent_prompt, build_agent_prompt_with_context
 from .context.store import ChatContextStore
 from .models import AgentConfig
 from .message_chunks import (
     MAX_DISCORD_MSG_LEN as _MAX_DISCORD_MSG_LEN,
     chunk_message as _chunk_message,
 )
-from .protocol import AgentRequest, Platform, PlatformDestination, PlatformOrigin
+from .protocol import (
+    AgentRequest,
+    Platform,
+    PlatformDestination,
+    PlatformOrigin,
+    runtime_job_response_text,
+)
 from .routing.mentions import MentionRouter
 from .sessions.store import SessionStore
 from .sessions.scope import (
@@ -101,21 +113,16 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         self._bot_user_id_map: dict[str, int] = {}
         self.tree = app_commands.CommandTree(self)
         self._commands_synced = False
+        self._reply_recovery_task: asyncio.Task | None = None
 
         # Bridge mode: submit via coordinate runtime
         self._agentd_mode = config.agentd_mode
-        self._coordinate_client: CoordinateRuntimeClient | None = None
+        self._coordinate_client: CoordinateRuntimeClient | CoordinateHttpRuntimeClient | None = None
 
         if config.agentd_mode:
-            if not config.coordinator_cli_path:
-                raise SystemExit(
-                    "agentd_mode requires coordinator_cli_path. "
-                    "Set it in agents.toml or the [defaults] section."
-                )
-            self._coordinate_client = CoordinateRuntimeClient(
-                cli_path=config.coordinator_cli_path,
-                db_path=config.coordinator_db_path,
-            )
+            # Single transport factory: cli (default) or http; fail closed on
+            # unknown transport or missing fields.
+            self._coordinate_client = make_coordinate_runtime_client(config)
             self.adapter = None
             self.session_store = None
         else:
@@ -142,6 +149,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
                 await bridge._on_client_ready(self)
             except Exception:
                 log.warning("bridge _on_client_ready failed", exc_info=True)
+
+        self._start_reply_recovery()
 
         # One-time guild-scoped slash command sync
         if not self._commands_synced:
@@ -173,7 +182,11 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         if after.author.id == self.user.id:
             return
         channel_id = self._resolve_channel_id(after)
-        if self.agent_config.channels and channel_id not in self.agent_config.channels:
+        if (
+            not self._agentd_mode
+            and self.agent_config.channels
+            and channel_id not in self.agent_config.channels
+        ):
             return
         if not self.agent_config.respond_to_bots:
             return
@@ -186,7 +199,10 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         # fall through with resolved_workspace=None for legacy non-agentd path.
         if self._agentd_mode:
             resolved_workspace = await self._resolve_or_notify(
-                after, channel_id=channel_id, addressed=True
+                after,
+                channel_id=channel_id,
+                addressed=True,
+                event_key=f"message:{after.id}",
             )
             if resolved_workspace is None:
                 return
@@ -205,9 +221,14 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         if message.author.id == self.user.id:
             return
 
-        # Layer 1: channel allowlist check (before any processing)
+        # Layer 1: legacy mode uses the configured allowlist. Managed mode uses
+        # Coordinate's channel binding as the sole runtime authority below.
         channel_id = self._resolve_channel_id(message)
-        if self.agent_config.channels and channel_id not in self.agent_config.channels:
+        if (
+            not self._agentd_mode
+            and self.agent_config.channels
+            and channel_id not in self.agent_config.channels
+        ):
             return
 
         addressed = self._is_addressed_to_me(message)
@@ -243,7 +264,10 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
             # Managed mode: resolve workspace before any context/handling/submit.
             if self._agentd_mode:
                 resolved_workspace = await self._resolve_or_notify(
-                    message, channel_id=channel_id, addressed=True
+                    message,
+                    channel_id=channel_id,
+                    addressed=True,
+                    event_key=f"message:{message.id}",
                 )
                 if resolved_workspace is None:
                     # None covers both unbound and lookup error; error already logged.
@@ -279,7 +303,9 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         if not addressed:
             # Managed mode must resolve even not-addressed inbound before writing context.
             if self._agentd_mode:
-                resolved_workspace = await self._resolve_silent(channel_id=channel_id)
+                resolved_workspace = await self._resolve_silent(
+                    channel_id=channel_id, event_key=f"message:{message.id}"
+                )
                 if resolved_workspace is not None:
                     self._record_message(message, resolved_workspace=resolved_workspace)
                 else:
@@ -294,7 +320,10 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         # Addressed human: resolve workspace before operator commands / context / submit.
         if self._agentd_mode:
             resolved_workspace = await self._resolve_or_notify(
-                message, channel_id=channel_id, addressed=True
+                message,
+                channel_id=channel_id,
+                addressed=True,
+                event_key=f"message:{message.id}",
             )
             if resolved_workspace is None:
                 return
@@ -339,6 +368,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         *,
         channel_id: int,
         addressed: bool,
+        event_key: str | None = None,
     ) -> str | None:
         """Resolve workspace and notify visible on unbound/lookup error when addressed.
 
@@ -348,7 +378,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
             return None
         try:
             resolved_workspace = await self._resolve_channel_workspace(
-                platform="discord", channel_id=channel_id
+                platform="discord", channel_id=channel_id, event_key=event_key
             )
         except CoordinateRuntimeError as exc:
             log.error(
@@ -382,13 +412,15 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         return resolved_workspace
 
-    async def _resolve_silent(self, *, channel_id: int) -> str | None:
+    async def _resolve_silent(
+        self, *, channel_id: int, event_key: str | None = None
+    ) -> str | None:
         """Resolve workspace without any visible output; return None on any failure."""
         if not self._agentd_mode:
             return None
         try:
             return await self._resolve_channel_workspace(
-                platform="discord", channel_id=channel_id
+                platform="discord", channel_id=channel_id, event_key=event_key
             )
         except CoordinateRuntimeError as exc:
             log.info(
@@ -422,22 +454,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         ``result_json`` string. Accept both shapes so the bridge does
         not fall back to ``"Job done"`` when a real reply is present.
         """
-        result_data = completed.get("result")
-        if result_data is None:
-            result_json_str = completed.get("result_json")
-            if result_json_str:
-                try:
-                    import json
-                    result_data = json.loads(result_json_str)
-                except (json.JSONDecodeError, TypeError):
-                    result_data = None
-        if isinstance(result_data, dict):
-            return (
-                result_data.get("response_text")
-                or result_data.get("text")
-                or "(empty response)"
-            )
-        return f"Job {completed.get('status', 'unknown')}"
+        return runtime_job_response_text(completed)
 
     def _record_message(self, message: discord.Message, *, resolved_workspace: str | None = None) -> None:
         """Persist message to context store using workspace-qualified context scope when managed.
@@ -518,16 +535,9 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         """Register /agents, /health, /session status, /session reset."""
         cfg = self.agent_config
 
-        def _is_channel_allowed(interaction: discord.Interaction) -> bool:
-            if not cfg.channels:
-                return True
-            ch = interaction.channel
-            ch_id = ch.parent_id if is_thread_channel(ch) else ch.id
-            return ch_id in cfg.channels
-
         @self.tree.command(name="agents", description="列出所有已知 agent")
         async def slash_agents(interaction: discord.Interaction):
-            if not _is_channel_allowed(interaction):
+            if not await self._is_runtime_channel_allowed(interaction.channel):
                 await interaction.response.send_message("此频道不可用。", ephemeral=True)
                 return
             deny = can_run_operator_command(cfg, interaction.user.id, "agents")
@@ -542,7 +552,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         @self.tree.command(name="health", description="检查 adapter 健康状态")
         async def slash_health(interaction: discord.Interaction):
-            if not _is_channel_allowed(interaction):
+            if not await self._is_runtime_channel_allowed(interaction.channel):
                 await interaction.response.send_message("此频道不可用。", ephemeral=True)
                 return
             deny = can_run_operator_command(cfg, interaction.user.id, "health")
@@ -572,7 +582,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         @session_group.command(name="status", description="显示会话状态")
         async def slash_session_status(interaction: discord.Interaction):
-            if not _is_channel_allowed(interaction):
+            if not await self._is_runtime_channel_allowed(interaction.channel):
                 await interaction.response.send_message("此频道不可用。", ephemeral=True)
                 return
             deny = can_run_operator_command(cfg, interaction.user.id, "session status")
@@ -591,7 +601,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         @session_group.command(name="reset", description="重置当前会话")
         async def slash_session_reset(interaction: discord.Interaction):
-            if not _is_channel_allowed(interaction):
+            if not await self._is_runtime_channel_allowed(interaction.channel):
                 await interaction.response.send_message("此频道不可用。", ephemeral=True)
                 return
             deny = can_run_operator_command(cfg, interaction.user.id, "session reset")
@@ -765,14 +775,45 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         # 2. Build prompt with context
         prompt_text = self._get_prompt_text(message)
-        prompt = build_agent_prompt(
-            context_store=self.context_store,
-            config=self.agent_config,
-            bot_id=self.user.id,
-            channel_id=context_channel_id,
-            message_id=str(message.id),
-            current_text=prompt_text,
-        )
+        context_envelope = None
+        if self._agentd_mode:
+            # _context_scope_for_message is workspace-qualified whenever a
+            # managed request is eligible for submission. Keep this explicit
+            # guard adjacent to envelope construction so a future caller
+            # cannot accidentally emit a bare channel scope.
+            if resolved_workspace and not context_channel_id.startswith(
+                f"workspace:{resolved_workspace}:"
+            ):
+                log.error(
+                    "Refusing context envelope with non-canonical scope: workspace=%s scope=%s",
+                    resolved_workspace,
+                    context_channel_id,
+                )
+                context_channel_id = workspace_channel_context_scope(
+                    workspace_id=resolved_workspace,
+                    platform="discord",
+                    channel_id=self._resolve_channel_id(message),
+                )
+            prompt, context_envelope = build_agent_prompt_with_context(
+                context_store=self.context_store,
+                config=self.agent_config,
+                bot_id=self.user.id,
+                channel_id=context_channel_id,
+                message_id=str(message.id),
+                current_text=prompt_text,
+                scope_id=context_channel_id,
+                session_scope_id=session_scope_id,
+                recipient={"id": self.agent_config.id, "name": self.agent_config.display_name},
+            )
+        else:
+            prompt = build_agent_prompt(
+                context_store=self.context_store,
+                config=self.agent_config,
+                bot_id=self.user.id,
+                channel_id=context_channel_id,
+                message_id=str(message.id),
+                current_text=prompt_text,
+            )
 
         progress_state: dict = {"partial": ""}
 
@@ -783,6 +824,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
                 legacy_scope_ids=legacy_scope_ids,
                 context_channel_id=context_channel_id,
                 resolved_workspace=resolved_workspace,
+                context_envelope=context_envelope,
             )
             return
 
@@ -846,6 +888,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         legacy_scope_ids: tuple[str, ...],
         context_channel_id: str,
         resolved_workspace: str | None = None,
+        context_envelope: Any | None = None,
     ) -> None:
         """Submit a request via coordinate runtime, poll for result, send to Discord."""
         channel = message.channel
@@ -871,11 +914,13 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
             "session_scope_id": session_scope_id,
             "legacy_scope_ids": list(legacy_scope_ids),
         }
+        if isinstance(context_envelope, dict):
+            origin["context"] = context_envelope
         # agentd_mode: bridge posts the response itself via the agent's
-        # DiscordClient. Set reply platform to "none" so coordinate creates
-        # a delivery record (for audit) but daemon does not pump it
-        # (daemon only pumps discord_webhook). This prevents the coordinator
-        # bot from duplicate-posting the agent's response.
+        # DiscordClient. Set reply platform to "none": coordinate keeps the
+        # job result/events as audit evidence but creates no delivery, and
+        # the daemon only pumps discord_webhook. Nothing is posted twice by
+        # the coordinator bot.
         reply_platform = "none" if self._agentd_mode else "discord"
         reply = {
             "platform": reply_platform,
@@ -911,6 +956,14 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
                     pass
             return
 
+        self.context_store.record_runtime_reply(
+            job_id=job_id,
+            workspace_id=resolved_workspace,
+            platform="discord",
+            destination_id=thread_id or channel_id,
+            quote_message_id=message_id,
+        )
+
         # Poll coordinate until agentd processes the job
         completed = await self._run_with_heartbeat(
             placeholder,
@@ -923,6 +976,7 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         if completed is None:
             display_text = "Agent timed out (no response from agentd)."
+            self._start_reply_recovery()
         else:
             display_text = self._extract_completed_display_text(completed)
 
@@ -930,13 +984,15 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
             display_text
         )
         handoff_lines, display_text = split_handoff_lines(resolved_response_text)
-        await self._send_text_chunks(
+        delivered = await self._send_text_chunks(
             channel,
             placeholder,
             display_text,
             handoff_lines,
             [],
         )
+        if completed is not None and delivered:
+            self.context_store.mark_runtime_reply_sent(job_id=job_id)
 
         if completed and completed.get("status") == "done":
             self.context_store.record_message(
@@ -951,7 +1007,62 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
                 ttl_seconds=self.agent_config.context_ttl_seconds,
             )
 
-    async def _resolve_channel_workspace(self, *, platform: str, channel_id: int) -> str | None:
+    async def _recover_runtime_replies(self) -> None:
+        """Replay bridge-owned terminal replies left by a prior process."""
+        if not self._coordinate_client:
+            return
+        pending = self.context_store.pending_runtime_replies(platform="discord")
+        for item in pending:
+            job_id = item["job_id"]
+            self.context_store.mark_runtime_reply_attempt(
+                job_id=job_id, error_code="recovery_started"
+            )
+            try:
+                completed = await self._coordinate_client.wait_for_job_result(
+                    job_id=job_id,
+                    workspace_id=item["workspace_id"],
+                    timeout=self.agent_config.timeout,
+                )
+                if completed is None:
+                    continue
+                channel = self.get_channel(int(item["destination_id"]))
+                if channel is None:
+                    channel = await self.fetch_channel(int(item["destination_id"]))
+                display_text = self._extract_completed_display_text(completed)
+                resolved = self.mention_router.resolve_handoff_mentions(display_text)
+                handoff_lines, display_text = split_handoff_lines(resolved)
+                delivered = await self._send_text_chunks(
+                    channel, None, display_text, handoff_lines, []
+                )
+                if delivered:
+                    self.context_store.mark_runtime_reply_sent(job_id=job_id)
+            except Exception:
+                self.context_store.mark_runtime_reply_attempt(
+                    job_id=job_id, error_code="recovery_failed"
+                )
+                log.warning(
+                    "Runtime reply recovery failed: agent=%s job=%s",
+                    self.agent_config.id,
+                    job_id,
+                    exc_info=True,
+                )
+
+    def _start_reply_recovery(self) -> None:
+        """Schedule one bridge-owned reply replay task at a time."""
+        if not self._agentd_mode:
+            return
+        if self._reply_recovery_task is None or self._reply_recovery_task.done():
+            self._reply_recovery_task = asyncio.create_task(
+                self._recover_runtime_replies()
+            )
+
+    async def _resolve_channel_workspace(
+        self,
+        *,
+        platform: str,
+        channel_id: int,
+        event_key: str | None = None,
+    ) -> str | None:
         """Resolve the workspace binding for a managed inbound channel.
 
         Returns the workspace id, None when unbound, or raises CoordinateRuntimeError
@@ -959,15 +1070,68 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         """
         if not self._agentd_mode or self._coordinate_client is None:
             return None
-        try:
+        async def resolve() -> str | None:
             return await self._coordinate_client.resolve_channel_workspace(
                 platform=platform,
                 channel_id=str(channel_id),
             )
+
+        bridge = getattr(self, "_bridge", None)
+        if bridge is not None and event_key:
+            resolve_shared = getattr(bridge, "resolve_channel_workspace", None)
+            if callable(resolve_shared):
+                authority_key = ":".join(
+                    str(getattr(self.agent_config, field, ""))
+                    for field in (
+                        "coordinate_transport",
+                        "coordinate_http_client_id",
+                        "coordinate_http_token_file",
+                        "coordinator_cli_path",
+                        "coordinator_db_path",
+                    )
+                )
+                try:
+                    return await resolve_shared(
+                        platform=platform,
+                        channel_id=str(channel_id),
+                        event_key=event_key,
+                        authority_key=authority_key,
+                        resolver=resolve,
+                    )
+                except CoordinateRuntimeError:
+                    raise
+                except Exception as exc:
+                    raise CoordinateRuntimeError(
+                        f"channel workspace resolve failed: {exc}"
+                    ) from exc
+        try:
+            return await resolve()
         except CoordinateRuntimeError:
             raise
         except Exception as exc:
             raise CoordinateRuntimeError(f"channel workspace resolve failed: {exc}") from exc
+
+    async def _is_runtime_channel_allowed(self, channel) -> bool:
+        """Apply the active channel authority for slash-command admission."""
+        channel_id = channel.parent_id if is_thread_channel(channel) else channel.id
+        if not self._agentd_mode:
+            return not self.agent_config.channels or channel_id in self.agent_config.channels
+        try:
+            return (
+                await self._resolve_channel_workspace(
+                    platform="discord",
+                    channel_id=channel_id,
+                )
+                is not None
+            )
+        except CoordinateRuntimeError as exc:
+            log.error(
+                "Discord slash-command workspace lookup failed: agent=%s channel=%s error=%s",
+                self.agent_config.id,
+                channel_id,
+                exc,
+            )
+            return False
 
     async def _send_adapter_response(
         self,
@@ -1040,25 +1204,30 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         display_text: str,
         handoff_lines: list[str],
         report_lines: list[str],
-    ) -> None:
+    ) -> bool:
         """Send display text, handoff lines, and report lines to Discord."""
+        delivered = False
         chunks = _chunk_message(display_text) if display_text else []
         if not chunks and not handoff_lines and not report_lines:
             if placeholder:
                 try:
                     await placeholder.edit(content="(no response)")
+                    delivered = True
                 except discord.HTTPException:
                     pass
-            return
+            return delivered
 
         if chunks:
             if placeholder:
                 try:
                     await placeholder.edit(content=chunks[0])
+                    delivered = True
                 except discord.HTTPException:
                     await channel.send(chunks[0])
+                    delivered = True
             else:
                 await channel.send(chunks[0])
+                delivered = True
             for chunk in chunks[1:]:
                 try:
                     await channel.send(chunk)
@@ -1073,14 +1242,17 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         for hl in handoff_lines:
             try:
                 await channel.send(hl)
+                delivered = True
             except discord.HTTPException:
                 pass
 
         for rl in report_lines:
             try:
                 await channel.send(rl, allowed_mentions=discord.AllowedMentions.none())
+                delivered = True
             except discord.HTTPException:
                 pass
+        return delivered
 
     @classmethod
     def _is_error_response(cls, text: str) -> bool:
@@ -1108,11 +1280,52 @@ class DiscordBridge:
         self.clients: list[DiscordClient] = []
         self._ready_event = asyncio.Event()
         self._all_ready = False
+        self._channel_resolve_inflight: dict[
+            tuple[str, str, str, str], asyncio.Future
+        ] = {}
 
         for cfg in configs:
             client = DiscordClient(cfg)
             client._bridge = self  # type: ignore[attr-defined]
             self.clients.append(client)
+
+    async def resolve_channel_workspace(
+        self,
+        *,
+        platform: str,
+        channel_id: str,
+        event_key: str,
+        authority_key: str,
+        resolver: Callable[[], Awaitable[str | None]],
+    ) -> str | None:
+        """Share one binding read among clients observing the same event.
+
+        The future is removed as soon as this event's resolution completes;
+        this is deliberately not a cross-event binding cache.
+        """
+        key = (authority_key, platform, str(channel_id), event_key)
+        existing = self._channel_resolve_inflight.get(key)
+        if existing is not None:
+            return await asyncio.shield(existing)
+
+        future = asyncio.get_running_loop().create_future()
+        self._channel_resolve_inflight[key] = future
+        try:
+            result = await resolver()
+        except BaseException as exc:
+            if not future.done():
+                future.set_exception(exc)
+            try:
+                await future
+            except BaseException:
+                pass
+            raise
+        else:
+            future.set_result(result)
+            return result
+        finally:
+            if self._channel_resolve_inflight.get(key) is future:
+                del self._channel_resolve_inflight[key]
 
     @property
     def agent_ids(self) -> list[str]:

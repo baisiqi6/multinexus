@@ -2,7 +2,7 @@
 
 > 本仓库是 MultiNexus 受支持的公开稳定版本与社区入口。已停止维护的 [`baisiqi6/discord-nexus`](https://github.com/baisiqi6/discord-nexus) 只作为历史 lineage 保留；来源与授权说明见 [docs/provenance.md](docs/provenance.md)。
 
-MultiNexus 是一个 agent 执行织物，用于将可替换的托管和外部 agent 运行时 — 包括 Claude Code、Codex、Qoder、Grok Build、OpenCode、Hermes、OMP 和支持 ACP v1 的 agent — 连接到持久的项目工作。
+MultiNexus 是一个 agent 执行织物，用于将可替换的托管和外部 agent 运行时 — 包括 Claude Code、Codex、Qoder、Grok Build、OpenCode、Hermes、OMP、ZCode 和支持 ACP v1 的 agent — 连接到持久的项目工作。
 
 它顶层与 Coordinate 项目协调内核、项目 Harness 和当前 Operator 共同工作：
 
@@ -34,7 +34,15 @@ MultiNexus 支持两种运行模式：
 1. **standalone direct-adapter**：`multinexus.py --platform discord` 直接调用本地 adapter；适合单主机、对话驱动的使用；
 2. **Coordinate-managed profile**：`multinexus.py` bridge 提交 job 到 Coordinate，由 `python -m multinexus.agentd --agent <id>` 在各个 agent 身份上认领执行；适合需要跨主机恢复、审查和独立生命周期的项目工作。
 
-第二种模式需要 Coordinate 控制面已部署并正确配置 `coordinator_cli_path`，不作为默认开箱即用路径。
+第二种模式需要先安装 [Coordinate v0.4.0](https://github.com/baisiqi6/coordinate/releases/tag/v0.4.0)，并选择 CLI（默认）或 loopback HTTP transport。agentd 启动前校验实际契约能力，缺失时拒绝 claim。Standalone 不依赖 Coordinate。
+
+### v0.2.0 升级
+
+本版新增 ZCode direct/app-server adapter、Runtime HTTP、managed context cursor、回复 outbox 与可选 agentd 健康文件。managed Discord 的消息和 slash-command 准入现在以 Coordinate **channel binding** 为权威，配置中的静态 `channels` 只约束 standalone；升级前检查绑定。
+
+先升级 Coordinate，再停用访问本地 context/session SQLite 的进程并备份数据库，最后升级 MultiNexus。首次打开数据库会为 sessions 增加 `context_generation`、`context_cursor_order_token`、`context_cursor_message_id`，并创建 `runtime_reply_outbox`，保留旧行。回退前须核查并处理待投递 outbox；旧版不理解新 cursor/outbox，不能承诺无损降级。恢复备份会舍弃备份后的记录。完整配置见 [平台设置](docs/platform-setup.md#runtime-http-与-v020-升级)。
+
+ZCode 默认 `headless`；受控写入/测试需显式启用 `app-server`，并安装已核验的固定 native bundle。权限与恢复限制见 [ZCode 权限说明](docs/zcode-permissions.md)。
 
 ---
 
@@ -46,7 +54,7 @@ multinexus.py --platform discord --config agents.toml
       └── multinexus/client.py  DiscordBridge → [每个 agent 一个 DiscordClient]
             │   每个 agent 是自己的 Discord 身份
             │
-            ├── multinexus/adapters/        ACP / Claude / Codex / Qoder / Grok / OpenCode / OMP 网关
+            ├── multinexus/adapters/        ACP / Claude / Codex / Qoder / Grok / OpenCode / OMP / ZCode 网关
             ├── multinexus/agentd/          Coordinate agent worker 运行时
             ├── multinexus/sessions/        per-scope 会话持久化
             ├── multinexus/commands.py      operator 命令处理器（文本）
@@ -86,7 +94,7 @@ washer.py（可选独立记忆提取）
   - 任意提供 stdio ACP v1 server 的 agent CLI（可选）
   - [OpenCode](https://opencode.ai/)、OMP 或 Hermes CLI
 - 使用 Coordinate-managed profile 时，还需安装
-  [Coordinate](https://github.com/baisiqi6/coordinate)；standalone profile 不需要。
+  [Coordinate v0.4.0](https://github.com/baisiqi6/coordinate/releases/tag/v0.4.0)；standalone profile 不需要。
 
 ### 2. 克隆和安装
 

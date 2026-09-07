@@ -15,6 +15,25 @@ from enum import Enum
 from typing import Any
 
 
+def runtime_job_response_text(completed: dict[str, Any]) -> str:
+    """Read the current or legacy Coordinate terminal-result envelope."""
+    result = completed.get("result")
+    if result is None:
+        raw = completed.get("result_json")
+        if isinstance(raw, str) and raw:
+            try:
+                result = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                result = None
+    if isinstance(result, dict):
+        for key in ("response_text", "text"):
+            value = result.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return "(empty response)"
+    return f"Job {completed.get('status', 'unknown')}"
+
+
 class Platform(str, Enum):
     DISCORD = "discord"
     KOOK = "kook"

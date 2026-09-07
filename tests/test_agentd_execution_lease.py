@@ -57,6 +57,8 @@ def _config(**overrides):
         "token": "fake-token",
         "adapter": "claude",
         "context_db_path": str(Path(tempfile.mkdtemp()) / "test.sqlite3"),
+        "coordinator_cli_path": "/bin/true",
+        "coordinator_db_path": "/tmp/test.db",
     }
     defaults.update(overrides)
     return AgentConfig(**defaults)
@@ -1270,19 +1272,21 @@ class ReapPolicyWorkerTests(unittest.TestCase):
             )
         )
 
+        self.assertEqual(len(claims), 1)
         self.assertEqual(
-            claims,
-            [
-                {
-                    "agent_id": "mac-omp",
-                    "recoverable": True,
-                    "recovery_reason": "prior-process-crashed",
-                    "prior_process_stopped": True,
-                    "reap_mode": "none",
-                    "reap_reason": "sealed-recovery-policy",
-                }
-            ],
+            {
+                key: value for key, value in claims[0].items() if key != "claim_request_id"
+            },
+            {
+                "agent_id": "mac-omp",
+                "recoverable": True,
+                "recovery_reason": "prior-process-crashed",
+                "prior_process_stopped": True,
+                "reap_mode": "none",
+                "reap_reason": "sealed-recovery-policy",
+            },
         )
+        self.assertRegex(claims[0]["claim_request_id"], r"^[0-9a-f]{32}$")
 
     def test_worker_invalid_reap_policy_fails_before_claim_or_running(self):
         worker = AgentdWorker(_config())

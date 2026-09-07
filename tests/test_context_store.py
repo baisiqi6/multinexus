@@ -61,3 +61,30 @@ def test_multiple_prefixes_returns_combined_count(store):
 def _contents(store):
     with store._connect() as conn:
         return [row[0] for row in conn.execute("SELECT content FROM messages")]
+
+
+def test_runtime_reply_outbox_replays_until_sent(store):
+    store.record_runtime_reply(
+        job_id="job-1",
+        workspace_id="workspace-1",
+        platform="discord",
+        destination_id="channel-1",
+        quote_message_id="message-1",
+        created_at_ms=123,
+    )
+    assert store.pending_runtime_replies(platform="discord") == [
+        {
+            "job_id": "job-1",
+            "workspace_id": "workspace-1",
+            "platform": "discord",
+            "destination_id": "channel-1",
+            "quote_message_id": "message-1",
+            "created_at_ms": 123,
+            "attempts": 0,
+            "last_error_code": "",
+        }
+    ]
+    store.mark_runtime_reply_attempt(job_id="job-1", error_code="recovery_failed")
+    assert store.pending_runtime_replies(platform="discord")[0]["attempts"] == 1
+    store.mark_runtime_reply_sent(job_id="job-1", sent_at_ms=456)
+    assert store.pending_runtime_replies(platform="discord") == []

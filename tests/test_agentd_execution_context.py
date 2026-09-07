@@ -30,6 +30,8 @@ def _config(**overrides):
         "token": "fake-token",
         "adapter": "claude",
         "context_db_path": str(Path(tempfile.mkdtemp()) / "test.sqlite3"),
+        "coordinator_cli_path": "/bin/true",
+        "coordinator_db_path": "/tmp/test.db",
     }
     defaults.update(overrides)
     return AgentConfig(**defaults)
@@ -295,9 +297,17 @@ class WorkerContextUsageTests(unittest.TestCase):
     def test_sequential_jobs_change_cwd_and_session_scope(self) -> None:
         worker, calls, _ = self._make_worker()
         stored = []
-        worker.session_store.upsert = lambda **kw: stored.append(kw)
+        upsert = worker.session_store.upsert
+        def record_upsert(**kw):
+            stored.append(kw)
+            return upsert(**kw)
+        worker.session_store.upsert = record_upsert
         async def mock_report(**kw):
-            return None
+            return {"result": {"job": {
+                "id": kw["job_id"], "assigned_agent": kw["agent_id"],
+                "status": kw["status"], "attempt_count": kw["attempt_token"],
+                "result": dict(kw["result_json"]),
+            }}}
         worker.coordinate.report_job = mock_report
 
         loop = asyncio.new_event_loop()
