@@ -122,3 +122,13 @@ MultiNexus 不扁平化该内部图。父调用负责返回一致的结果，除
 - 来源与维护：`docs/provenance.md`
 
 历史设计与任务证据不再进入当前架构导航；它们保留在私有开发历史中。
+
+## v0.2.0 的 managed context 与 runtime
+
+bridge 构造有 scope/message order 身份的 context envelope。worker 只有在 session、workspace、generation 和 cursor 匹配时使用增量；缺失或不一致时使用完整历史。结果按 Coordinate report 确认后才通过 CAS 推进 session/cursor，stale report 不覆盖新状态。
+
+bridge 使用本地 `runtime_reply_outbox` 保留待完成投递，按同一 runtime job/result 恢复；已确认投递不会再发送。不把 job success 当成 Harness acceptance，远端平台投递与本地确认之间仍可能存在需要 Operator 核查的不确定窗口。
+
+agentd 通过单一 CLI 或 HTTP factory 访问 Coordinate，先验证 capability contract，再使用 claim key 和 agent-scoped reconcile。reconcile 只提供 authority 证据，不自行授权新的 claim。HTTP 不提供 operator recoverable claim。健康文件只是该进程的有限观测；以 Coordinate 的 job/lease 为运行权威。
+
+managed Discord admission 统一使用 Coordinate channel binding；standalone 保留静态 channels。SQLite 升级及回退限制见 [平台设置](platform-setup.md#runtime-http-与-v020-升级)。

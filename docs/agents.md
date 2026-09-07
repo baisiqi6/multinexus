@@ -176,3 +176,11 @@ discord_user_id = 100000000000000001
 
 不要仅在 `routing/dispatcher.py` 添加名字；当前 bridge 的真实加载 authority 是
 `multinexus/adapters/factory.py`。
+
+## ZCode
+
+手工配置 `adapter = "zcode"`，不在 Standalone setup 向导或现有 `setup --check` executor 清单内；后者不能用于验证 ZCode 配置。`zcode_bin` 指向本机安装的可执行入口；需要 Node 显式运行 CJS 时配置独立的 `zcode_node_bin` argv。Windows 使用这两个独立字段。
+
+默认 `zcode_transport = "headless"`，使用固定 JSON 形状提取文本/session；历史 headless contract 为 0.16.3。受控编辑和测试使用 `app-server`，固定到 0.16.5 CJS 的 SHA-256（详见 [权限说明](zcode-permissions.md)），不自动适配任意新版本。vendor bundle、登录和凭据由用户单独管理，仓库不分发 vendor。
+
+app-server 只允许 workspace 内符合策略的 Write/Edit，以及 Operator 逐字列出的完整 Bash command。空命令列表拒绝 Bash。它不是 OS sandbox，已批准程序本身的行为需要被信任。恢复要求同 session、workspace、provider/model 和 policy；恢复失败不会自动新开 session 重做任务。默认 headless 不因此获得受控写入能力。

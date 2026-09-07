@@ -1,6 +1,7 @@
 """Tests for the agentd HTTP server and client."""
 
 import asyncio
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -367,6 +368,78 @@ class TestAgentDaemonHTTPEndToEnd(unittest.TestCase):
 
 class TestReapPolicy(unittest.TestCase):
     """Test normalize_claim_reap_policy and CoordinateRuntimeClient claim_job integration."""
+
+    def test_cli_runtime_contract_probe_requires_fencing_capabilities(self):
+        from multinexus.agentd.coordinate_client import CoordinateRuntimeClient
+
+        client = CoordinateRuntimeClient(
+            cli_path="/usr/local/bin/coord-local",
+            db_path="/var/lib/coordinate/coord.sqlite3",
+        )
+        with patch.object(
+            client,
+            "_run_cli_text",
+            side_effect=[
+                "coordinate 0.3.1",
+                "usage: coordinate runtime job claim --claim-request-id",
+                "usage: coordinate runtime agent reconcile",
+                "usage: coordinate runtime job report",
+                "usage: coordinate runtime job lease renew",
+            ],
+        ) as probe:
+            result = asyncio.run(client.get_runtime_contract())
+
+        self.assertEqual(result["contract_version"], 1)
+        self.assertEqual(result["transport"], "cli")
+        self.assertEqual(result["coordinate_version"], "coordinate 0.3.1")
+        self.assertEqual(probe.call_count, 5)
+
+    def test_cli_runtime_contract_probe_rejects_missing_claim_fence(self):
+        from multinexus.agentd.coordinate_client import (
+            CoordinateContractError,
+            CoordinateRuntimeClient,
+        )
+
+        client = CoordinateRuntimeClient(
+            cli_path="/usr/local/bin/coord-local",
+            db_path="/var/lib/coordinate/coord.sqlite3",
+        )
+        with patch.object(
+            client,
+            "_run_cli_text",
+            side_effect=[
+                "coordinate 0.3.0",
+                "usage: coordinate runtime job claim",
+                "usage: coordinate runtime agent reconcile",
+                "usage: coordinate runtime job report",
+                "usage: coordinate runtime job lease renew",
+            ],
+        ):
+            with self.assertRaises(CoordinateContractError):
+                asyncio.run(client.get_runtime_contract())
+
+    def test_keyed_cli_parser_rejection_is_not_authority_uncertain(self):
+        from multinexus.agentd.coordinate_client import (
+            CoordinateContractError,
+            CoordinateRuntimeClient,
+        )
+
+        client = CoordinateRuntimeClient(
+            cli_path="/usr/local/bin/coord-local",
+            db_path="/var/lib/coordinate/coord.sqlite3",
+        )
+        rejected = subprocess.CompletedProcess(
+            ["coord-local"],
+            2,
+            stdout="",
+            stderr="usage: coordinate ...\\nunrecognized arguments: --claim-request-id\\n",
+        )
+        with patch(
+            "multinexus.agentd.coordinate_client.subprocess.run",
+            return_value=rejected,
+        ):
+            with self.assertRaises(CoordinateContractError):
+                asyncio.run(client.claim_job(agent_id="a", claim_request_id="claim-1"))
 
     def test_default_global_returns_canonical(self):
         from multinexus.agentd.coordinate_client import normalize_claim_reap_policy

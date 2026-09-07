@@ -706,6 +706,101 @@ class TestAgentdWorkerCoordinateFlow(unittest.TestCase):
             type("R", (), {"text": "omp CLI failed (1): err", "metadata": {}})()
         ), "failed")
 
+    def test_worker_zcode_resume_error_fails_closed_without_fresh_call(self):
+        """An exact-session adapter can disable the legacy fresh fallback."""
+        from multinexus.agentd.worker import AgentdWorker
+        from multinexus.adapters.base import AdapterResult
+
+        cfg = _config(
+            coordinator_cli_path="/usr/bin/true",
+            coordinator_db_path="/tmp/test.db",
+        )
+
+        class ResumeFailZCodeAdapter:
+            allow_fresh_fallback_after_resume_error = False
+
+            def __init__(self):
+                self.calls = []
+                self.resumes = []
+
+            async def call(self, prompt, **kw):
+                self.calls.append(prompt)
+                return AdapterResult(text="fresh duplicate", session_id="sess_new")
+
+            async def resume(self, sid, prompt, **kw):
+                self.resumes.append((sid, prompt))
+                return AdapterResult(
+                    text="ZCode resume failed: session mismatch",
+                    session_id=sid,
+                )
+
+            async def health_check(self):
+                return {"adapter": "zcode", "available": True}
+
+        worker = AgentdWorker(cfg)
+        worker.adapter = ResumeFailZCodeAdapter()
+        worker.session_store.upsert(
+            scope_id="channel:zcode",
+            agent_id="test-agent",
+            adapter="zcode",
+            session_id="sess_existing",
+            work_dir=cfg.work_dir,
+        )
+        job = {
+            "id": "job-zcode-resume-fail",
+            "payload_json": json.dumps(
+                {
+                    "prompt": "continue",
+                    "origin": {
+                        "platform": "discord",
+                        "destination": "zcode",
+                        "session_scope_id": "channel:zcode",
+                        "legacy_scope_ids": [],
+                    },
+                }
+            ),
+        }
+        reported = []
+
+        async def mock_report(
+            *,
+            job_id,
+            agent_id,
+            status,
+            result_json,
+            attempt_token=None,
+            lease_id=None,
+        ):
+            reported.append({"status": status, "result_json": result_json})
+
+        worker.coordinate.report_job = mock_report
+        with patch.object(
+            worker.session_store,
+            "mark_stale",
+            wraps=worker.session_store.mark_stale,
+        ) as mark_stale:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(worker._process_job(_claim_result(job)))
+            finally:
+                loop.close()
+
+        self.assertEqual(worker.adapter.resumes, [("sess_existing", "continue")])
+        self.assertEqual(worker.adapter.calls, [])
+        mark_stale.assert_called_once()
+        self.assertEqual(mark_stale.call_args.kwargs["expected_session"]["session_id"], "sess_existing")
+        self.assertEqual(reported[0]["status"], "failed")
+        self.assertEqual(
+            reported[0]["result_json"]["response_text"],
+            "ZCode resume failed: session mismatch",
+        )
+        self.assertIsNone(
+            worker.session_store.get_first_active(
+                scope_ids=("channel:zcode",), agent_id="test-agent"
+            )
+        )
+
+
     def test_worker_shutdown_is_testable(self):
         """Worker stop() sets _running=False and wakes the event for immediate exit."""
         from multinexus.agentd.worker import AgentdWorker
@@ -1083,8 +1178,25 @@ class TestWorkerSessionResume(unittest.TestCase):
         self.assertEqual(reported[0]["status"], "timed_out")
         self.assertEqual(reported[0]["result_json"]["session_id"], "sess-progress")
         self.assertEqual(reported[0]["result_json"]["timeout"]["kind"], "activity")
-        stored = worker.session_store.get(scope_id="channel:ch-timeout", agent_id="test-agent")
-        self.assertEqual(stored["session_id"], "sess-progress")
+        # In-flight recovery has one durable owner: Coordinate. A timeout
+        # does not publish an unconfirmed session into SessionStore.
+        self.assertIsNone(worker.session_store.get(
+            scope_id="channel:ch-timeout", agent_id="test-agent"
+        ))
+        resumed = []
+        class RecoveryAdapter:
+            async def call(self, prompt, **kw):
+                raise AssertionError("recovery must not start fresh")
+            async def resume(self, session_id, prompt, **kw):
+                resumed.append(session_id)
+                return AdapterResult(text="recovered", session_id=session_id, resumed=True)
+        recovered_worker = AgentdWorker(cfg)
+        recovered_worker.adapter = RecoveryAdapter()
+        recovered_worker.coordinate.report_job = mock_report
+        recovery_job = {**job, "result": reported[0]["result_json"], "attempt_count": 2}
+        asyncio.run(recovered_worker._process_job(_claim_result(recovery_job, attempt_token=2)))
+        self.assertEqual(resumed, ["sess-progress"])
+        self.assertEqual(reported[-1]["status"], "done")
 
     def test_worker_resumes_recoverable_job_session_without_fresh_duplicate(self):
         """Recoverable timed-out jobs use the recorded session id when no local session exists."""

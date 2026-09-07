@@ -4,6 +4,14 @@ multinexus 的所有重要变更都记录在这里。
 
 ---
 
+## [0.2.0] — 2026-09-07
+
+- 新增 ZCode direct adapter 与显式 opt-in 的 app-server 路线，支持固定 native bundle、逐次权限决策、精确 session 恢复及受保护的 Windows launcher；默认 headless。
+- 新增可选 loopback Runtime HTTP transport；agentd 在 claim 前校验 Coordinate v0.4.0 契约能力，支持 claim key 重放、agent reconcile 和权限不确定时停止新 claim。
+- managed Discord 准入改为 Coordinate channel binding authority；standalone 继续使用静态 channels allowlist，不依赖 Coordinate。
+- 新增带身份/CAS 校验的 context cursor、durable runtime reply outbox 和可选 agentd 健康投影；保留既有 machine outcome 与公开错误处理契约。
+- 本地 sessions SQLite 增加三个 context cursor 字段，context SQLite 新建 runtime_reply_outbox，保留旧行。升级顺序为 Coordinate -> 备份本地 DB -> MultiNexus；回退前处理 outbox，旧版无法消费新投影，不保证无损降级。
+
 ## [0.1.3] — 2026-08-02
 
 - 新增 generic ACP v1 adapter（`adapter = "acp"`）：通过 stdio 连接任意 ACP v1 agent

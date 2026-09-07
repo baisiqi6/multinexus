@@ -41,6 +41,26 @@ class ChatContextStore:
                         "CREATE INDEX IF NOT EXISTS idx_messages_channel_time "
                         "ON messages(channel_id, created_at_ms)"
                     )
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS runtime_reply_outbox (
+                            job_id TEXT PRIMARY KEY,
+                            workspace_id TEXT NOT NULL,
+                            platform TEXT NOT NULL,
+                            destination_id TEXT NOT NULL,
+                            quote_message_id TEXT NOT NULL DEFAULT '',
+                            created_at_ms INTEGER NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'pending',
+                            attempts INTEGER NOT NULL DEFAULT 0,
+                            last_error_code TEXT NOT NULL DEFAULT '',
+                            sent_at_ms INTEGER
+                        )
+                        """
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_runtime_reply_status "
+                        "ON runtime_reply_outbox(platform, status, created_at_ms)"
+                    )
                     return
             except sqlite3.OperationalError as exc:
                 last_exc = exc
@@ -102,12 +122,13 @@ class ChatContextStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT message_id, author_id, author_name, author_is_bot, content, created_at_ms
+                SELECT rowid AS context_order, message_id, author_id, author_name,
+                       author_is_bot, content, created_at_ms
                 FROM messages
                 WHERE channel_id = ?
                   AND message_id != ?
                   AND created_at_ms >= ?
-                ORDER BY created_at_ms DESC
+                ORDER BY created_at_ms DESC, rowid DESC
                 LIMIT ?
                 """,
                 (channel_id, exclude_message_id, cutoff_ms, fetch_limit),
@@ -115,7 +136,7 @@ class ChatContextStore:
 
         selected: list[dict[str, Any]] = []
         used = 0
-        for message_id, author_id, author_name, author_is_bot, content, created_at_ms in rows:
+        for context_order, message_id, author_id, author_name, author_is_bot, content, created_at_ms in rows:
             line_len = len(author_name) + len(content) + 16
             if selected and (used + line_len > budget_chars or len(selected) >= limit):
                 break
@@ -127,10 +148,63 @@ class ChatContextStore:
                     "author_is_bot": bool(author_is_bot),
                     "content": content,
                     "created_at_ms": created_at_ms,
+                    # SQLite rowid is the insertion order tie-breaker and is
+                    # deliberately exposed as the context cursor.  It is
+                    # not a second piece of mutable state.
+                    "context_order": int(context_order),
                 }
             )
             used += line_len
         return list(reversed(selected))
+
+    def message_order(self, *, channel_id: str, message_id: str) -> int | None:
+        """Return the SQLite insertion order for one stored message."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT rowid FROM messages WHERE channel_id = ? AND message_id = ?",
+                (channel_id, message_id),
+            ).fetchone()
+        return int(row[0]) if row else None
+
+    def message_by_id(
+        self, *, channel_id: str, message_id: str
+    ) -> dict[str, Any] | None:
+        """Return one message and its SQLite rowid for envelope anchoring.
+
+        This intentionally performs a point read instead of changing the
+        bounded-history query.  A missing current row means callers must keep
+        their legacy full prompt and omit the optimization envelope.
+        """
+        if not isinstance(channel_id, str) or not channel_id.strip():
+            return None
+        if not isinstance(message_id, str) or not message_id.strip():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT rowid AS context_order, message_id, author_id, author_name,
+                       author_is_bot, content, created_at_ms
+                FROM messages
+                WHERE channel_id = ? AND message_id = ?
+                LIMIT 1
+                """,
+                (channel_id, message_id),
+            ).fetchone()
+        if row is None:
+            return None
+        context_order, stored_id, author_id, author_name, author_is_bot, content, created_at_ms = row
+        return {
+            "context_order": int(context_order),
+            "message_id": str(stored_id),
+            "author_id": str(author_id),
+            "author_name": str(author_name),
+            "author_is_bot": bool(author_is_bot),
+            "content": str(content),
+            "created_at_ms": int(created_at_ms),
+        }
+
+    # Explicit alias for callers that use the conventional getter spelling.
+    get_message = message_by_id
 
     def purge_bot_messages_by_prefixes(self, prefixes: tuple[str, ...]) -> int:
         if not prefixes:
@@ -178,3 +252,94 @@ class ChatContextStore:
                 ),
             ).fetchone()
         return row is not None
+
+    def record_runtime_reply(
+        self,
+        *,
+        job_id: str,
+        workspace_id: str,
+        platform: str,
+        destination_id: str,
+        quote_message_id: str = "",
+        created_at_ms: int | None = None,
+    ) -> None:
+        """Journal a Coordinate job whose visible reply is bridge-owned."""
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (job_id, workspace_id, platform, destination_id)
+        ):
+            raise ValueError("runtime reply identity fields must be non-empty strings")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO runtime_reply_outbox (
+                    job_id, workspace_id, platform, destination_id,
+                    quote_message_id, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id.strip(),
+                    workspace_id.strip(),
+                    platform.strip().lower(),
+                    destination_id.strip(),
+                    quote_message_id.strip() if isinstance(quote_message_id, str) else "",
+                    created_at_ms if created_at_ms is not None else int(time.time() * 1000),
+                ),
+            )
+
+    def pending_runtime_replies(
+        self, *, platform: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Return bridge-owned replies awaiting a successful platform send."""
+        if not isinstance(platform, str) or not platform.strip():
+            return []
+        bounded_limit = max(1, min(int(limit), 100))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT job_id, workspace_id, platform, destination_id,
+                       quote_message_id, created_at_ms, attempts, last_error_code
+                FROM runtime_reply_outbox
+                WHERE platform = ? AND status = 'pending'
+                ORDER BY created_at_ms ASC
+                LIMIT ?
+                """,
+                (platform.strip().lower(), bounded_limit),
+            ).fetchall()
+        return [
+            {
+                "job_id": row[0],
+                "workspace_id": row[1],
+                "platform": row[2],
+                "destination_id": row[3],
+                "quote_message_id": row[4],
+                "created_at_ms": row[5],
+                "attempts": row[6],
+                "last_error_code": row[7],
+            }
+            for row in rows
+        ]
+
+    def mark_runtime_reply_attempt(self, *, job_id: str, error_code: str = "") -> None:
+        """Record a bounded recovery attempt without storing exception text."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE runtime_reply_outbox
+                SET attempts = attempts + 1, last_error_code = ?
+                WHERE job_id = ? AND status = 'pending'
+                """,
+                (error_code[:64] if isinstance(error_code, str) else "", job_id),
+            )
+
+    def mark_runtime_reply_sent(self, *, job_id: str, sent_at_ms: int | None = None) -> None:
+        """Acknowledge a visible send after the platform call returns."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE runtime_reply_outbox
+                SET status = 'sent', sent_at_ms = ?
+                WHERE job_id = ? AND status = 'pending'
+                """,
+                (sent_at_ms if sent_at_ms is not None else int(time.time() * 1000), job_id),
+            )

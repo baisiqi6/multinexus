@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 
 from multinexus.client import DiscordBridge, DiscordClient
+from multinexus.agentd.coordinate_client import CoordinateRuntimeError
 from multinexus.config import load_all_configs_for_platform, load_config
 from multinexus.models import AgentConfig
 
@@ -174,6 +175,7 @@ class DiscordBridgeMentionPropagationTests(unittest.TestCase):
         finally:
             self._teardown_bridge_user_patches(bridge)
 
+
     def test_both_clients_ready_yields_full_map(self):
         bridge = self._build_bridge_with_mocked_users()
         try:
@@ -197,6 +199,124 @@ class DiscordBridgeMentionPropagationTests(unittest.TestCase):
             self.assertIsInstance(bridge.is_all_ready(), bool)
         finally:
             self._teardown_bridge_user_patches(bridge)
+
+
+class DiscordBridgeChannelResolveTests(unittest.IsolatedAsyncioTestCase):
+    """Binding reads are shared only while one inbound event is in flight."""
+
+    async def test_same_event_uses_one_resolver(self):
+        bridge = DiscordBridge([_make_cfg("mac-claude"), _make_cfg("mac-codex")])
+        calls = 0
+        release = asyncio.Event()
+
+        async def resolver():
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return "workspace-1"
+
+        first = asyncio.create_task(
+            bridge.resolve_channel_workspace(
+                platform="discord", channel_id="channel-1", event_key="message:1",
+                authority_key="bridge", resolver=resolver,
+            )
+        )
+        await asyncio.sleep(0)
+        second = asyncio.create_task(
+            bridge.resolve_channel_workspace(
+                platform="discord", channel_id="channel-1", event_key="message:1",
+                authority_key="bridge", resolver=resolver,
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(calls, 1)
+        release.set()
+        self.assertEqual(
+            await asyncio.gather(first, second), ["workspace-1", "workspace-1"]
+        )
+        self.assertEqual(bridge._channel_resolve_inflight, {})
+
+    async def test_failure_is_shared_then_removed_for_next_event(self):
+        bridge = DiscordBridge([_make_cfg("mac-claude")])
+        calls = 0
+
+        async def failing_resolver():
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0)
+            raise RuntimeError("binding unavailable")
+
+        results = await asyncio.gather(
+            *[
+                bridge.resolve_channel_workspace(
+                    platform="discord", channel_id="channel-1", event_key="message:1",
+                    authority_key="bridge", resolver=failing_resolver,
+                )
+                for _ in range(2)
+            ],
+            return_exceptions=True,
+        )
+        self.assertEqual(calls, 1)
+        self.assertTrue(all(isinstance(result, RuntimeError) for result in results))
+        self.assertEqual(bridge._channel_resolve_inflight, {})
+
+        async def next_resolver():
+            nonlocal calls
+            calls += 1
+            return "workspace-2"
+
+        result = await bridge.resolve_channel_workspace(
+            platform="discord", channel_id="channel-1", event_key="message:2",
+            authority_key="bridge", resolver=next_resolver,
+        )
+        self.assertEqual(result, "workspace-2")
+        self.assertEqual(calls, 2)
+
+    async def test_different_authority_does_not_share_inflight_result(self):
+        bridge = DiscordBridge([_make_cfg("mac-claude")])
+        release = asyncio.Event()
+        calls = []
+
+        async def resolver():
+            calls.append("called")
+            await release.wait()
+            return "workspace"
+
+        first = asyncio.create_task(
+            bridge.resolve_channel_workspace(
+                platform="discord", channel_id="channel-1", event_key="message:1",
+                authority_key="principal-a", resolver=resolver,
+            )
+        )
+        await asyncio.sleep(0)
+        second = asyncio.create_task(
+            bridge.resolve_channel_workspace(
+                platform="discord", channel_id="channel-1", event_key="message:1",
+                authority_key="principal-b", resolver=resolver,
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(len(calls), 2)
+        release.set()
+        self.assertEqual(await asyncio.gather(first, second), ["workspace", "workspace"])
+
+    async def test_client_wraps_shared_resolver_error(self):
+        client = DiscordClient.__new__(DiscordClient)
+        client._agentd_mode = True
+        client._coordinate_client = object()
+        client.agent_config = _make_cfg("mac-claude")
+
+        class FailingBridge:
+            async def resolve_channel_workspace(self, **_kwargs):
+                raise RuntimeError("unexpected resolver failure")
+
+        client._bridge = FailingBridge()
+        with self.assertRaises(CoordinateRuntimeError):
+            await client._resolve_channel_workspace(
+                platform="discord",
+                channel_id=123,
+                event_key="message:1",
+            )
 
 
 class LoadAllConfigsForPlatformTests(unittest.TestCase):

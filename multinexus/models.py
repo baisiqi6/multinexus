@@ -1,9 +1,21 @@
+import os
 import sys
+from pathlib import Path
 from dataclasses import dataclass, field
 
 DEFAULT_OPENCLAW_BIN = "openclaw"
 DEFAULT_HERMES_BIN = "hermes"
 CODEX_CMD = "codex.cmd" if sys.platform == "win32" else "codex"
+ZCODE_APP_BIN = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
+DEFAULT_ZCODE_BIN = (
+    str(ZCODE_APP_BIN)
+    if (
+        sys.platform == "darwin"
+        and ZCODE_APP_BIN.is_file()
+        and os.access(ZCODE_APP_BIN, os.X_OK)
+    )
+    else "zcode"
+)
 
 
 @dataclass
@@ -63,8 +75,16 @@ class AgentConfig:
     grok_bin: str = "grok"
     grok_reasoning_effort: str | None = None
     grok_permission_mode: str = "dontAsk"
+    zcode_bin: str = DEFAULT_ZCODE_BIN
+    zcode_node_bin: str | None = None
+    zcode_home_dir: str | None = None
+    zcode_permission_mode: str = "build"
+    zcode_transport: str = "headless"
+    zcode_context_root: str | None = None
+    zcode_permission_commands: list[str] = field(default_factory=list)
     acp_command: str = ""
     acp_args: list[str] = field(default_factory=list)
+
     allowed_user_ids: list[int] = field(default_factory=list)
     wiki_enabled: bool = False
     wiki_path: str = "wiki"
@@ -73,6 +93,13 @@ class AgentConfig:
     coordinator_cli_path: str = ""
     coordinator_db_path: str = ""
     coordinator_workspace_path: str = ""
+
+    # R2B: preferred coordinate runtime transport ("cli" default, "http").
+    # coordinator_cli_path/coordinator_db_path stay as the CLI-compat fields.
+    coordinate_transport: str = "cli"
+    coordinate_http_base_url: str = ""
+    coordinate_http_client_id: str = ""
+    coordinate_http_token_file: str = ""
 
     # Agentd (local daemon mode)
     agentd_mode: bool = False

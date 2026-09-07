@@ -21,6 +21,8 @@ def _config(**overrides):
         "token": "fake-token",
         "adapter": "omp",
         "context_db_path": str(Path(tempfile.mkdtemp()) / "test.sqlite3"),
+        "coordinator_cli_path": "/bin/true",
+        "coordinator_db_path": "/tmp/test.db",
     }
     defaults.update(overrides)
     return AgentConfig(**defaults)

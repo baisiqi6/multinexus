@@ -4,9 +4,9 @@
 # token_env names for the host where the process runs. Keep agents.toml local
 # and uncommitted; real tokens belong in .env.
 #
-# For Coordinate-managed execution, set agentd_mode = true and provide
-# coordinator_cli_path pointing either to an installed Coordinate console
-# script on this host or to a reviewed wrapper.
+# For Coordinate-managed execution, set agentd_mode = true and install
+# a Coordinate server with v0.4.0 capabilities. CLI is the default transport; alternatively
+# use loopback HTTP as described below. Never execute both transports.
 # The authority roster (id, display_name, discord_user_id) lives in
 # config/agent-registry.example.toml; copy it to config/agent-registry.toml and
 # keep it secret-free.
@@ -14,6 +14,15 @@
 [defaults]
 # Standalone foreground bridge: false. Coordinate-managed worker: true.
 agentd_mode = false
+coordinate_transport = "cli"
+# Optional HTTP: install Coordinate with its runtime-http extra and start its
+# authenticated listener locally, or use an authenticated SSH local-forward.
+# coordinate_transport = "http"
+# coordinate_http_base_url = "http://127.0.0.1:8765"
+# coordinate_http_client_id = "<client-id>"
+# coordinate_http_token_file = "/absolute/private/path/runtime-token"
+# CLI DB settings below apply only to CLI transport; HTTP clients never open
+# the server database. HTTP bridge and agentd use separate scoped credentials.
 
 # Direct local install example (macOS/Linux). Windows uses
 # C:\absolute\path\to\coordinate\.venv\Scripts\coordinate.exe.
@@ -40,7 +49,9 @@ timeout = 360
 first_byte_timeout = 120
 activity_timeout = 120
 
-# Optional safety gates. Fill with real Discord snowflakes in agents.toml.
+# Standalone channel allowlist; managed Discord uses Coordinate bindings.
+# allowed_user_ids continues to gate Operator commands in both modes.
+# Fill with real Discord snowflakes in local agents.toml.
 channels = []
 allowed_user_ids = []
 # coordinator_bot_id = 123456789012345678
@@ -159,3 +170,18 @@ claude_bin = "claude"
 # display_name = "Hermes"
 # aliases = ["Hermes"]
 # discord_user_id = "<discord-user-id>"
+
+# Optional ZCode entry (manual configuration, not in the setup wizard).
+# [[agents]]
+# id = "host-zcode"
+# adapter = "zcode"
+# display_name = "ZCode"
+# token_env = "DISCORD_ZCODE_TOKEN"
+# work_dir = "/absolute/path/to/workspace"
+# zcode_bin = "/absolute/path/to/zcode.cjs"
+# zcode_node_bin = "/absolute/path/to/node" # required when CJS is not executable
+# zcode_transport = "headless" # opt in to "app-server" for scoped permissions
+# zcode_permission_mode = "build"
+# zcode_context_root = "/absolute/private/path/zcode-contexts" # outside workspace
+# zcode_permission_commands = [] # deny all Bash unless exact commands are listed
+# See docs/zcode-permissions.md before enabling app-server.

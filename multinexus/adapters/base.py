@@ -40,6 +40,11 @@ ERROR_PREFIXES = (
     "Grok error:",
     "Grok resume failed:",
     "Grok CLI not found",
+    "ZCode CLI failed",
+    "ZCode timeout after",
+    "ZCode error:",
+    "ZCode resume failed:",
+    "ZCode CLI not found",
     "ACP error:",
     "ACP timeout after",
     "ACP command not found",
@@ -206,6 +211,8 @@ def timed_out_result(text: str, **kwargs: Any) -> AdapterResult:
 
 class AgentAdapter(ABC):
     """Base class for agent backends (CLI subprocess wrappers)."""
+
+    allow_fresh_fallback_after_resume_error = True
 
     def __init__(self, name: str, timeout: int = 360):
         self.name = name

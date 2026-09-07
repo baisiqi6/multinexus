@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import shutil
 import tomllib
@@ -12,8 +13,48 @@ from .models import (
     CODEX_CMD,
     DEFAULT_HERMES_BIN,
     DEFAULT_OPENCLAW_BIN,
+    DEFAULT_ZCODE_BIN,
     KnownAgentMention,
 )
+
+
+# R2B: the four transport env keys are only authoritative from the process
+# environment (service manager), never from a shared .env file. See
+# _load_dotenv_preserving_coordinate_env.
+_COORDINATE_ENV_KEYS = (
+    "MULTINEXUS_COORDINATE_TRANSPORT",
+    "MULTINEXUS_COORDINATE_HTTP_BASE_URL",
+    "MULTINEXUS_COORDINATE_HTTP_CLIENT_ID",
+    "MULTINEXUS_COORDINATE_HTTP_TOKEN_FILE",
+)
+_ZCODE_ENV_KEYS = (
+    "MULTINEXUS_ZCODE_TRANSPORT",
+    "MULTINEXUS_ZCODE_CONTEXT_ROOT",
+    "MULTINEXUS_ZCODE_PERMISSION_COMMANDS",
+)
+
+
+def _load_dotenv_preserving_coordinate_env() -> None:
+    """Keep service-only Coordinate and ZCode overrides out of shared .env.
+
+    Before loading, the four process-env values are snapshotted; after the
+    load (and also when load_dotenv() raises) each key is restored to its
+    snapshot, or removed when the snapshot did not contain it — so a .env
+    file can never inject a transport override into the runtime config.
+    """
+    snapshot = {
+        key: os.environ.get(key)
+        for key in (*_COORDINATE_ENV_KEYS, *_ZCODE_ENV_KEYS)
+        if key in os.environ
+    }
+    try:
+        load_dotenv()
+    finally:
+        for key in (*_COORDINATE_ENV_KEYS, *_ZCODE_ENV_KEYS):
+            if key in snapshot:
+                os.environ[key] = snapshot[key]
+            else:
+                os.environ.pop(key, None)
 
 
 def _as_list(value: Any) -> list[str]:
@@ -22,6 +63,36 @@ def _as_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
     return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+def _zcode_options(merged: dict[str, Any]) -> dict[str, Any]:
+    """Parse exact ZCode policy values without the generic list coercion."""
+    values = {key: merged.get(key, default) for key, default in (
+        ("zcode_transport", "headless"), ("zcode_context_root", None),
+        ("zcode_permission_commands", []),
+    )}
+    if merged.get("adapter") == "zcode":
+        for env_key, key in zip(_ZCODE_ENV_KEYS, values):
+            if env_key in os.environ:
+                value: Any = os.environ[env_key]
+                if key == "zcode_permission_commands":
+                    try:
+                        value = json.loads(value)
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError("MULTINEXUS_ZCODE_PERMISSION_COMMANDS must be a JSON string array") from exc
+                values[key] = value
+    if values["zcode_transport"] not in ("headless", "app-server"):
+        raise ValueError("zcode_transport must be headless or app-server")
+    root = values["zcode_context_root"]
+    if root is not None and (not isinstance(root, str) or not Path(root).is_absolute()):
+        raise ValueError("zcode_context_root must be an explicit absolute path")
+    commands = values["zcode_permission_commands"]
+    if not isinstance(commands, list) or any(
+        not isinstance(command, str) or not command.strip() or "\x00" in command
+        for command in commands
+    ):
+        raise ValueError("zcode_permission_commands must be a list of non-empty exact strings")
+    return values
 
 
 def _as_int_list(value: Any) -> list[int]:
@@ -267,6 +338,26 @@ def _load_toml_agent(
         grok_permission_mode=str(
             merged.get("grok_permission_mode", "dontAsk")
         ),
+        zcode_bin=_first_existing_command(
+            os.getenv("ZCODE_BIN"),
+            str(merged.get("zcode_bin", "")),
+            shutil.which("zcode"),
+            DEFAULT_ZCODE_BIN,
+        ),
+        zcode_node_bin=(
+            str(merged["zcode_node_bin"])
+            if merged.get("zcode_node_bin")
+            else None
+        ),
+        zcode_home_dir=(
+            str(merged["zcode_home_dir"])
+            if merged.get("zcode_home_dir")
+            else None
+        ),
+        zcode_permission_mode=str(
+            merged.get("zcode_permission_mode", "build")
+        ),
+        **_zcode_options(merged),
         acp_command=str(merged.get("acp_command", "")),
         acp_args=_as_list(merged.get("acp_args")),
         wiki_enabled=_as_bool(merged.get("wiki_enabled"), False),
@@ -287,6 +378,22 @@ def _load_toml_agent(
         coordinator_workspace_path=str(
             Path(str(merged["coordinator_workspace_path"])).expanduser()
         ) if merged.get("coordinator_workspace_path") else "",
+        coordinate_transport=str(
+            os.getenv("MULTINEXUS_COORDINATE_TRANSPORT")
+            or merged.get("coordinate_transport", "cli")
+        ),
+        coordinate_http_base_url=str(
+            os.getenv("MULTINEXUS_COORDINATE_HTTP_BASE_URL")
+            or merged.get("coordinate_http_base_url", "")
+        ),
+        coordinate_http_client_id=str(
+            os.getenv("MULTINEXUS_COORDINATE_HTTP_CLIENT_ID")
+            or merged.get("coordinate_http_client_id", "")
+        ),
+        coordinate_http_token_file=str(
+            os.getenv("MULTINEXUS_COORDINATE_HTTP_TOKEN_FILE")
+            or merged.get("coordinate_http_token_file", "")
+        ),
         agentd_mode=_as_bool(merged.get("agentd_mode"), False),
         agentd_port=int(merged.get("agentd_port", 0)),
         agentd_host=str(merged.get("agentd_host", "127.0.0.1")),
@@ -299,7 +406,7 @@ def _load_toml_agent(
 def load_config(
     argv: list[str] | None = None, *, require_token: bool = True
 ) -> AgentConfig:
-    load_dotenv()
+    _load_dotenv_preserving_coordinate_env()
 
     parser = argparse.ArgumentParser(
         description="MultiNexus single-agent bot runner"
@@ -335,7 +442,7 @@ def load_all_configs_for_platform(
     to a platform gateway; the caller is responsible for ensuring the bridge
     entry point resolves platform tokens at startup.
     """
-    load_dotenv()
+    _load_dotenv_preserving_coordinate_env()
     path = Path(
         config_path
         or os.getenv("DISCORD_AGENTS_CONFIG")
