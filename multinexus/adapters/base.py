@@ -244,6 +244,15 @@ class AgentAdapter(ABC):
             prompt, timeout=timeout, work_dir=work_dir, on_progress=on_progress
         )
 
+    async def startup_check(self) -> dict | None:
+        """Optional local initialization probe before a managed worker claims work.
+
+        None preserves the existing startup behavior of adapters without a probe.
+        A probe result must explicitly set runtime_ready to True to allow claims;
+        it does not establish provider authentication, quota, or task success.
+        """
+        return None
+
     @abstractmethod
     async def health_check(self) -> dict:
         """Check if the agent backend is available. Returns status dict."""

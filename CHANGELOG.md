@@ -4,6 +4,11 @@ multinexus 的所有重要变更都记录在这里。
 
 ---
 
+## [0.2.1] — 2026-09-08
+
+- 修复 OMP 在版本命令成功、但本地 runtime/SQLite 只读时仍被判为可用并领取 managed job 的问题；worker 首次 claim 前进行无 prompt 的 RPC 启动预检，失败后保持 `latched`，零领取并等待 Operator 停止。
+- OMP 健康响应区分 `binary_available`、`runtime_ready` 与 `provider_checked=false`；探测有界清理、屏蔽原始 state/stderr，明确本地初始化写入和延迟，不宣称 provider 或运行目录迁移已验证。
+
 ## [0.2.0] — 2026-09-07
 
 - 新增 ZCode direct adapter 与显式 opt-in 的 app-server 路线，支持固定 native bundle、逐次权限决策、精确 session 恢复及受保护的 Windows launcher；默认 headless。
