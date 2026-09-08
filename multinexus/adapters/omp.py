@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import shutil
 
@@ -7,6 +8,28 @@ from .base import AdapterResult, AgentAdapter, failed_result, timed_out_result
 from .utils import async_subprocess_kwargs, filtered_env, terminate_owned_process_group
 
 log = logging.getLogger(__name__)
+
+
+STARTUP_TIMEOUT_SECONDS = 15
+STARTUP_OUTPUT_LIMIT = 1024 * 1024
+_STARTUP_REQUEST_ID = "multinexus-startup"
+_RUNTIME_DIRECTORY_HINT = (
+    "OMP runtime and SQLite state must be writable (default: ~/.omp; "
+    "profiles and environment overrides may change the location)."
+)
+
+
+class _StartupOutputLimit(Exception):
+    pass
+
+
+async def _read_startup_output(reader: asyncio.StreamReader) -> bytes:
+    output = bytearray()
+    while chunk := await reader.read(8192):
+        if len(output) + len(chunk) > STARTUP_OUTPUT_LIMIT:
+            raise _StartupOutputLimit
+        output.extend(chunk)
+    return bytes(output)
 
 
 class OmpAdapter(AgentAdapter):
@@ -140,6 +163,122 @@ class OmpAdapter(AgentAdapter):
 
         return AdapterResult(text=response_text, session_id=session_id)
 
+    async def startup_check(self) -> dict:
+        """Initialize RPC locally without sending a prompt or retaining a session.
+
+        Unlike --version, this exercises OMP's runtime/SQLite initialization.
+        It can write local runtime state. Optional extensions/tools are disabled;
+        a successful probe is not a provider or per-job workspace acceptance.
+        """
+        cmd = [arg for arg in self._build_cmd(no_session=True)
+               if arg not in ("-p", "--auto-approve")]
+        cmd += [
+            "--mode", "rpc", "--no-tools", "--no-extensions", "--no-skills",
+            "--no-rules", "--no-lsp", "--no-title", "--no-pty",
+        ]
+        result = {
+            "runtime_ready": False,
+            "provider_checked": False,
+            "reason_code": "runtime_startup_failed",
+            "runtime_directory_hint": _RUNTIME_DIRECTORY_HINT,
+        }
+        proc = None
+        cleanup_attempted = False
+
+        async def cleanup() -> None:
+            nonlocal cleanup_attempted
+            if proc is not None and not cleanup_attempted:
+                cleanup_attempted = True
+                await terminate_owned_process_group(proc)
+
+        async def exchange() -> tuple[bytes, bytes]:
+            readers = [
+                asyncio.create_task(_read_startup_output(proc.stdout)),
+                asyncio.create_task(_read_startup_output(proc.stderr)),
+                asyncio.create_task(proc.wait()),
+            ]
+            try:
+                request = {"id": _STARTUP_REQUEST_ID, "type": "get_state"}
+                try:
+                    proc.stdin.write((json.dumps(request) + "\n").encode())
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    # A failed initialization may close stdin before reading it.
+                    # Still drain its bounded stderr to classify the local failure.
+                    pass
+                finally:
+                    proc.stdin.close()
+                stdout, stderr, _ = await asyncio.gather(*readers)
+                return stdout, stderr
+            finally:
+                for reader in readers:
+                    if not reader.done():
+                        reader.cancel()
+                await asyncio.gather(*readers, return_exceptions=True)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.config.work_dir,
+                env=filtered_env(cwd=self.config.work_dir),
+                **async_subprocess_kwargs(),
+            )
+            stdout, stderr = await asyncio.wait_for(exchange(), STARTUP_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            await cleanup()
+            raise
+        except Exception as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                result["reason_code"] = "runtime_timeout"
+            elif isinstance(exc, _StartupOutputLimit):
+                result["reason_code"] = "runtime_output_limit"
+            # Spawn errors also include a missing cwd. Only the separate
+            # --version check can identify binary availability unambiguously.
+            try:
+                if proc is not None:
+                    await cleanup()
+            except Exception:
+                result["reason_code"] = "runtime_cleanup_failed"
+                log.error("OMP startup probe process cleanup failed")
+            return result
+
+        if proc.returncode != 0:
+            if any(marker in stderr.lower() for marker in (
+                b"sqlite_readonly", b"readonly database", b"read-only file system",
+                b"eacces", b"erofs", b"permission denied",
+            )):
+                result["reason_code"] = "runtime_not_writable"
+            return result
+
+        # Never forward raw state or stderr: state can contain private provider,
+        # session and configuration facts. Validate only the required RPC frames.
+        ready = False
+        responses = []
+        try:
+            for line in stdout.splitlines():
+                if not line.strip():
+                    continue
+                frame = json.loads(line)
+                if not isinstance(frame, dict):
+                    raise ValueError("not an RPC object")
+                if frame.get("type") == "ready":
+                    ready = type(frame.get("protocolVersion")) is int and frame["protocolVersion"] == 1
+                if frame.get("type") == "response" and frame.get("id") == _STARTUP_REQUEST_ID:
+                    responses.append(frame)
+            valid = (
+                ready and len(responses) == 1
+                and responses[0].get("command") == "get_state"
+                and responses[0].get("success") is True
+            )
+        except (ValueError, UnicodeError, RecursionError):
+            valid = False
+        result["runtime_ready"] = bool(valid)
+        result["reason_code"] = "ready" if valid else "runtime_protocol_error"
+        return result
+
     async def health_check(self) -> dict:
         bin_path = self.config.omp_bin
         proc = None
@@ -169,9 +308,17 @@ class OmpAdapter(AgentAdapter):
             available = False
 
         found = shutil.which(bin_path)
+        runtime = await self.startup_check() if available else {
+            "runtime_ready": False,
+            "provider_checked": False,
+            "reason_code": "binary_unavailable",
+            "runtime_directory_hint": _RUNTIME_DIRECTORY_HINT,
+        }
         return {
             "adapter": "omp",
             "bin": bin_path,
-            "available": available,
+            "binary_available": available,
+            "available": available and runtime["runtime_ready"] is True,
             "path": found,
+            **runtime,
         }

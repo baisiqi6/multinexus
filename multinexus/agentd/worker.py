@@ -104,7 +104,7 @@ class AgentdWorker:
         except CoordinateRuntimeError:
             self.health.write("degraded", "contract_probe_unavailable")
             raise
-        self.health.write("ready")
+        self.health.write("starting", "adapter_probe")
         return contract
 
     async def run(
@@ -150,8 +150,40 @@ class AgentdWorker:
                 )
             normalized_rec_reason = ""
         self._running = True
-        if self.health.state == "stopped":
-            self.health.write("ready")
+        self.health.write("starting", "adapter_probe")
+        check = getattr(self.adapter, "startup_check", None)
+        try:
+            readiness = await check() if callable(check) else None
+            ready = readiness is None or (
+                isinstance(readiness, dict) and readiness.get("runtime_ready") is True
+            )
+        except asyncio.CancelledError:
+            self._running = False
+            self.health.write("stopped", "startup_cancelled")
+            raise
+        except Exception:
+            # Adapter output and exceptions may include private runtime state.
+            # Publish a stable reason; detailed sanitized status belongs to health.
+            ready = False
+        if not self._running:
+            return
+        if not ready:
+            self.health.write("latched", "adapter_not_ready")
+            log.error(
+                "Adapter runtime is not ready; refusing to claim work. "
+                "Check adapter health, CLI compatibility and writable runtime state "
+                "(OMP default: ~/.omp; profiles/environment can change the location). "
+                "Process stays alive until stopped."
+            )
+            try:
+                while self._running:
+                    await self._wake.wait()
+                    self._wake.clear()
+            finally:
+                if self._running:
+                    self.stop()
+            return
+        self.health.write("ready")
         if recoverable:
             log.warning(
                 "Agentd worker started in RECOVERY mode: agent=%s reason=%s (will claim timed_out+recoverable jobs)",

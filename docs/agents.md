@@ -184,3 +184,33 @@ discord_user_id = 100000000000000001
 默认 `zcode_transport = "headless"`，使用固定 JSON 形状提取文本/session；历史 headless contract 为 0.16.3。受控编辑和测试使用 `app-server`，固定到 0.16.5 CJS 的 SHA-256（详见 [权限说明](zcode-permissions.md)），不自动适配任意新版本。vendor bundle、登录和凭据由用户单独管理，仓库不分发 vendor。
 
 app-server 只允许 workspace 内符合策略的 Write/Edit，以及 Operator 逐字列出的完整 Bash command。空命令列表拒绝 Bash。它不是 OS sandbox，已批准程序本身的行为需要被信任。恢复要求同 session、workspace、provider/model 和 policy；恢复失败不会自动新开 session 重做任务。默认 headless 不因此获得受控写入能力。
+
+## OMP 启动预检
+
+OMP 的命令版本可用，不代表它能初始化本地运行状态。managed worker 每次启动时，在第一次
+领取 Coordinate job 之前执行一次无 prompt 的 RPC 初始化探测；不会在每次空闲轮询时重复启动
+OMP。探测失败时，健康投影进入 `latched` / `adapter_not_ready`，进程保持存活等待停止，
+不领取任务、分配执行 lease 或生成 provider receipt。修正目录权限或 CLI 配置后，停止并重新
+启动该 worker 才会重新预检。
+
+OMP 的 `/health` 与健康命令同时提供：
+
+- `binary_available`：`omp --version` 是否成功。
+- `runtime_ready`：RPC 初始化、`ready` frame、对应 `get_state` 成功响应与正常退出是否都通过。
+- `available`：上述两项均通过，供既有状态展示使用。
+- `provider_checked=false`：没有验证 provider 认证、额度或模型执行；不能作为任务成功证据。
+
+探测使用配置的 executable、模型、thinking、cwd 与原有过滤后的 child environment，只发送
+`get_state`，不发送用户 prompt；关闭 session 持久化以及可选 tools/extensions/skills/rules、
+LSP、title 与 PTY。它仍可能初始化 OMP 的本地 SQLite/runtime/cache，**不是零写入操作**；
+`/health` 每次请求同样执行探测，可能增加数秒延迟。结果只证明配置 cwd 下的本地初始化，
+不覆盖关闭的可选功能、后续任务 worktree 权限或启动后发生的环境变化。
+
+`runtime_not_writable` 表示 CLI 初始化报告只读或权限失败。默认 OMP 状态位于 `~/.omp`，
+profile 或原生环境配置可能改变路径；`runtime_directory_hint` 是默认位置提示，不是对任意
+OMP 配置的路径解析结果。应在实际 worker 所在的 sandbox/身份下检查 OMP 所需运行目录。
+本版不增加运行目录重定向参数，不复制凭据，不整体替换 `HOME` 或更改父进程环境。
+
+探测要求 CLI 支持 OMP RPC v1 `ready` 与 `get_state` 响应，已用 OMP 18.1.5 验证；不提供
+该握手的版本会以 `runtime_protocol_error` 停止领取，而不会仅凭 `--version` 判定可用。
+超时、输出超限或启动错误只返回固定原因码，原始 stderr/state 不进入健康响应。

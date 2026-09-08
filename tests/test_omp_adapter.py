@@ -298,6 +298,9 @@ class TestOmpHealthCheck(unittest.IsolatedAsyncioTestCase):
         with (
             patch("multinexus.adapters.omp.shutil.which", return_value="/usr/local/bin/omp"),
             patch("multinexus.adapters.omp.asyncio.create_subprocess_exec", new=fake_exec),
+            patch.object(adapter, "startup_check", new=AsyncMock(return_value={
+                "runtime_ready": True, "provider_checked": False, "reason_code": "ready",
+            })),
         ):
             result = await adapter.health_check()
 

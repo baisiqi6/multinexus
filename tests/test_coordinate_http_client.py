@@ -804,6 +804,7 @@ class WorkerClaimLatchTests(HttpWireTestBase):
         )
         with patch("multinexus.agentd.worker.make_adapter") as mock_factory:
             adapter = MagicMock()
+            adapter.startup_check = AsyncMock(return_value=None)
             adapter.call = AsyncMock(
                 return_value=AdapterResult(text="ok", session_id=None)
             )
