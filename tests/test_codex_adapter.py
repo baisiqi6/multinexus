@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from multinexus.adapters.base import OUTCOME_FAILED, OUTCOME_TIMED_OUT
+from multinexus.adapters.base import (
+    DIAGNOSTIC_MAX_BYTES,
+    DIAGNOSTIC_TRUNCATION_MARKER,
+    OUTCOME_FAILED,
+    OUTCOME_SUCCESS,
+    OUTCOME_TIMED_OUT,
+)
 from multinexus.adapters.codex import CodexAdapter
 from multinexus.config import _load_toml_agent
 from multinexus.models import AgentConfig
@@ -24,7 +30,7 @@ class _FakeStream:
         return b""
 
     async def read(self):
-        return b""
+        return b"".join(self._lines)
 
 
 class _FakeStdin:
@@ -42,11 +48,11 @@ class _FakeStdin:
 
 
 class _FakeProcess:
-    def __init__(self, events=None, *, hang=False, returncode=0):
+    def __init__(self, events=None, *, hang=False, returncode=0, stderr_lines=None):
         lines = [(json.dumps(event) + "\n").encode("utf-8") for event in (events or [])]
         self.stdin = _FakeStdin()
         self.stdout = _FakeStream(lines, hang=hang)
-        self.stderr = _FakeStream([])
+        self.stderr = _FakeStream(stderr_lines or [])
         self.returncode = None
         self._final_returncode = returncode
         self.killed = False
@@ -429,3 +435,143 @@ class TestCodexSettlement(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.outcome, OUTCOME_FAILED)
         self.assertEqual(result.error_category, "protocol_error")
         self.assertTrue(result.resumed)
+
+    async def _run_call(
+        self,
+        events=None,
+        *,
+        hang=False,
+        returncode=0,
+        stderr_lines=None,
+        **overrides,
+    ):
+        proc = _FakeProcess(
+            events, hang=hang, returncode=returncode, stderr_lines=stderr_lines
+        )
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        async def fake_cleanup(target):
+            target.kill()
+            await target.wait()
+
+        adapter = CodexAdapter(_config(**overrides))
+        with (
+            patch(
+                "multinexus.adapters.codex.asyncio.create_subprocess_exec",
+                new=fake_exec,
+            ),
+            patch(
+                "multinexus.adapters.codex.terminate_owned_process_group",
+                new=fake_cleanup,
+            ),
+        ):
+            return await adapter.call("work")
+
+    async def test_native_error_precedes_mcp_stderr_noise(self):
+        native_error = "unexpected status 400 Bad Request: native request rejected"
+        noises = (
+            "MCP transport failed during startup",
+            "MCP noise mentions selected model is at capacity",
+            "MCP transport failed during startup: " + "噪" * 2000,
+        )
+        for noise in noises:
+            with self.subTest(noise=noise[:60]):
+                result = await self._run_call(
+                    [
+                        {"type": "thread.started", "thread_id": "native-fresh"},
+                        {"type": "error", "message": native_error},
+                        {"type": "turn.failed", "error": {"message": native_error}},
+                    ],
+                    returncode=1,
+                    stderr_lines=[noise.encode("utf-8")],
+                )
+
+                self.assertEqual(result.effective_outcome(), OUTCOME_FAILED)
+                self.assertEqual(result.error_category, "process_error")
+                self.assertEqual(result.text, f"Codex CLI failed (1): {native_error}")
+                self.assertEqual(result.session_id, "native-fresh")
+                self.assertFalse(result.resumed)
+                self.assertTrue(result.diagnostic.startswith(native_error))
+                self.assertIn(noise[:35], result.diagnostic)
+                self.assertLessEqual(len(result.diagnostic.encode("utf-8")), DIAGNOSTIC_MAX_BYTES)
+                self.assertNotIn("\ufffd", result.diagnostic)
+                if len(noise.encode("utf-8")) > DIAGNOSTIC_MAX_BYTES:
+                    self.assertTrue(result.diagnostic.endswith(DIAGNOSTIC_TRUNCATION_MARKER))
+
+    async def test_native_capacity_with_stderr_noise_preserves_fallback(self):
+        for fallback_model in (None, "fallback-model"):
+            with self.subTest(fallback_model=fallback_model):
+                processes = [
+                    _FakeProcess(
+                        [{"type": "error", "message": "selected model is at capacity"}],
+                        returncode=1,
+                        stderr_lines=[b"MCP transport failed during startup"],
+                    ),
+                    _FakeProcess([
+                        {"type": "thread.started", "thread_id": "fallback-thread"},
+                        {"item": {"type": "agent_message", "text": "fallback done"}},
+                    ]),
+                ]
+                commands = []
+
+                async def fake_exec(*args, **kwargs):
+                    commands.append(args)
+                    return processes.pop(0)
+
+                adapter = CodexAdapter(_config(
+                    model="primary-model", codex_fallback_model=fallback_model,
+                ))
+                with patch(
+                    "multinexus.adapters.codex.asyncio.create_subprocess_exec",
+                    new=fake_exec,
+                ):
+                    result = await adapter.call("work")
+
+                self.assertEqual(commands[0][commands[0].index("--model") + 1], "primary-model")
+                if fallback_model:
+                    self.assertEqual(len(commands), 2)
+                    self.assertEqual(commands[1][commands[1].index("--model") + 1], fallback_model)
+                    self.assertEqual(result.effective_outcome(), OUTCOME_SUCCESS)
+                    self.assertIsNone(result.error_category)
+                    self.assertEqual(result.text, "fallback done")
+                    self.assertEqual(result.session_id, "fallback-thread")
+                else:
+                    self.assertEqual(len(commands), 1)
+                    self.assertEqual(result.effective_outcome(), OUTCOME_FAILED)
+                    self.assertEqual(result.error_category, "provider_error")
+                    self.assertIn("capacity", result.text)
+
+    async def test_resume_native_error_precedes_mcp_stderr_noise(self):
+        native_error = "unexpected status 400 Bad Request: native request rejected"
+        noise = "MCP transport failed during startup: " + "噪" * 2000
+        proc = _FakeProcess(
+            [
+                {"type": "thread.started", "thread_id": "native-resume"},
+                {"type": "turn.failed", "error": {"message": native_error}},
+            ],
+            returncode=1,
+            stderr_lines=[noise.encode("utf-8")],
+        )
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        adapter = CodexAdapter(_config())
+        with patch(
+            "multinexus.adapters.codex.asyncio.create_subprocess_exec",
+            new=fake_exec,
+        ):
+            result = await adapter.resume("native-resume", "work")
+
+        self.assertEqual(result.effective_outcome(), OUTCOME_FAILED)
+        self.assertEqual(result.error_category, "protocol_error")
+        self.assertEqual(result.text, f"Codex resume failed (1): {native_error}")
+        self.assertEqual(result.session_id, "native-resume")
+        self.assertTrue(result.resumed)
+        self.assertTrue(result.diagnostic.startswith(native_error))
+        self.assertIn(noise[:35], result.diagnostic)
+        self.assertLessEqual(len(result.diagnostic.encode("utf-8")), DIAGNOSTIC_MAX_BYTES)
+        self.assertNotIn("\ufffd", result.diagnostic)
+        self.assertTrue(result.diagnostic.endswith(DIAGNOSTIC_TRUNCATION_MARKER))

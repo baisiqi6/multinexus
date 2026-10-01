@@ -4,6 +4,11 @@ multinexus 的所有重要变更都记录在这里。
 
 ---
 
+## [0.2.2] — 2026-10-01
+
+- 修复 Codex native provider error 被 MCP startup stderr 遮盖的问题；fresh/resume 失败优先展示 native error，secondary stderr 保留在既有 UTF-8 安全的有界 diagnostic 中。
+- capacity 分类只看 primary cause，保留配置的 fallback，避免 stderr 中无关 capacity 文本误触发或阻断 fallback。
+
 ## [0.2.1] — 2026-09-08
 
 - 修复 OMP 在版本命令成功、但本地 runtime/SQLite 只读时仍被判为可用并领取 managed job 的问题；worker 首次 claim 前进行无 prompt 的 RPC 启动预检，失败后保持 `latched`，零领取并等待 Operator 停止。

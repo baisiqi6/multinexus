@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..models import AgentConfig
-from .base import CATEGORY_TIMEOUT, AdapterResult, AgentAdapter, failed_result, timed_out_result
+from .base import (
+    CATEGORY_TIMEOUT,
+    AdapterResult,
+    AgentAdapter,
+    bounded_diagnostic,
+    failed_result,
+    timed_out_result,
+)
 from .utils import async_subprocess_kwargs, filtered_env, terminate_owned_process_group
 
 log = logging.getLogger(__name__)
@@ -30,6 +37,7 @@ class CodexRunResult:
     # Minimal closed failure information (a FAILURE_CATEGORIES value, or None
     # for success) carried to the single conversion seam in call().
     error_category: str | None = None
+    diagnostic: str = ""
 
 
 def extract_codex_text(event: dict[str, Any]) -> str:
@@ -208,6 +216,7 @@ class CodexAdapter(AgentAdapter):
             text=run.text,
             category=run.error_category,
             session_id=run.session_id,
+            diagnostic=run.diagnostic,
         )
 
     async def _run_once(self, full_prompt: str, model: str | None, *, work_dir: str | None = None) -> CodexRunResult:
@@ -323,12 +332,16 @@ class CodexAdapter(AgentAdapter):
             if proc.returncode != 0:
                 assert proc.stderr is not None
                 stderr = (await proc.stderr.read()).decode("utf-8", errors="replace").strip()
-                detail = stderr or error_text or f"exit code {proc.returncode}"
+                detail = error_text.strip() or stderr or f"exit code {proc.returncode}"
+                diagnostic = detail
+                if error_text.strip() and stderr:
+                    diagnostic += f"\n\nstderr:\n{stderr}"
                 return failed_result(
                     text=f"Codex resume failed ({proc.returncode}): {detail[:500]}",
                     category="protocol_error",
                     session_id=session_id,
                     resumed=True,
+                    diagnostic=bounded_diagnostic(diagnostic),
                 )
 
             response_text = response_text.strip()
@@ -437,8 +450,11 @@ async def _run_codex_process(
         await proc.wait()
         if not response_text and proc.returncode != 0:
             assert proc.stderr is not None
-            stderr = (await proc.stderr.read()).decode("utf-8", errors="replace")
-            detail = stderr.strip() or error_text.strip() or "\n".join(stdout_tail)[-1000:]
+            stderr = (await proc.stderr.read()).decode("utf-8", errors="replace").strip()
+            detail = error_text.strip() or stderr or "\n".join(stdout_tail)[-1000:]
+            diagnostic = detail
+            if error_text.strip() and stderr:
+                diagnostic += f"\n\nstderr:\n{stderr}"
             capacity_error = is_capacity_error(detail)
             log.error(
                 "Codex CLI failed: model= rc=%s capacity=%s",
@@ -452,6 +468,7 @@ async def _run_codex_process(
                 error_category=(
                     "provider_error" if capacity_error else "process_error"
                 ),
+                diagnostic=bounded_diagnostic(diagnostic),
             )
         response_text = response_text.strip()
         if not response_text:
