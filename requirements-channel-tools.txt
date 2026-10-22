@@ -1,0 +1,2 @@
+# Optional CLI dependency; bridge/agentd installations do not require it.
+mcp>=2,<3

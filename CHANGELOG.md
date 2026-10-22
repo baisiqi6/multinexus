@@ -4,6 +4,12 @@ multinexus 的所有重要变更都记录在这里。
 
 ---
 
+## [0.3.0] — 2026-10-21
+
+- 新增 `python -m multinexus.channel_cli read|send|wait`，调用 Coordinate v0.5.0 的频道工具；MCP SDK 是可选依赖，不影响原 bridge/agentd 安装。
+- 必需 workspace/channel，凭据从指定环境变量读取，返回统一 JSON 和稳定退出码；发送未知结果保留同 key，不自动重试。
+- 复用现有控制面，不新增 bot、队列或调度器。桌面唤醒、忙态/恢复与 Windows 验收继续留后续。
+
 ## [0.2.2] — 2026-10-01
 
 - 修复 Codex native provider error 被 MCP startup stderr 遮盖的问题；fresh/resume 失败优先展示 native error，secondary stderr 保留在既有 UTF-8 安全的有界 diagnostic 中。
