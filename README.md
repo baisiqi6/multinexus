@@ -46,6 +46,51 @@ ZCode 默认 `headless`；受控写入/测试需显式启用 `app-server`，并�
 
 ---
 
+## 频道工具 CLI（Phase 1）
+
+正在运行的 Agent 可以通过现有 Coordinate Remote MCP 读取、发送和有界等待项目频道消息，
+继续使用自己的原生会话上下文。此接口不自动唤醒闲置会话，也不创建 Worker、job、订阅或新 MCP 服务。
+第一期只支持已绑定 workspace 的 Discord 普通服务器文字频道，不支持线程、论坛、私信或 KOOK。
+
+CLI 的 MCP SDK 是可选依赖，bridge/agentd 不需要安装它：
+
+```bash
+python -m pip install -r requirements-channel-tools.txt
+export MULTINEXUS_CHANNEL_MCP_URL='https://control.example/mcp'
+# 通过现有安全凭据注入机制设置 MULTINEXUS_CHANNEL_MCP_TOKEN。
+# --token-env 可以改用另一个已设置的环境变量名；不接受明文 --token。
+
+python -m multinexus.channel_cli read --workspace project-a --channel 123456 --limit 20
+python -m multinexus.channel_cli send --workspace project-a --channel 123456 \
+  --text-file review-request.txt --send-key batch-07-review-01
+python -m multinexus.channel_cli send --workspace project-a --channel 123456 \
+  --text '收到，我会继续检查。' --send-key batch-07-reply-01 --reply-to-message-id 987654
+python -m multinexus.channel_cli wait --workspace project-a --channel 123456 \
+  --after "$cursor" --timeout 20
+```
+
+每个子命令都可用 `--url` 覆盖 endpoint、用 `--token-env NAME` 指定凭据环境变量。
+endpoint 要求 HTTPS；仅本机 loopback HTTP 供隔离测试使用，禁止 URL 内嵌凭据。
+服务端必须已部署 Coordinate v0.5.0 的 `coordinate.channel_read`、`coordinate.channel_send`、`coordinate.channel_wait`，
+并为专属 principal 授予对应 tools/workspaces/platforms scope。频道当前 active binding 必须精确属于
+请求 workspace；CLI 不改变权限、不推断身份，也不读取桌面 session/provider/model 配置。
+
+`read` 默认只取最近 20 条（`--limit` 为 1–100）；带 `--after` 才从该 opaque cursor 之后继续。
+各 Agent 自己保存返回的 `next_cursor`，服务端不维护共享已读位置。`wait` 必须给 `--after`，
+`--timeout` 为 0–30 秒；0 表示立即检查一次。整个客户端调用最多 45 秒，没有后台等待。
+`send` 正文最多 1800 UTF-16 code units，文件必须为 UTF-8；不自动分片或重试。
+
+除 `--help` 外，stdout 只有一个 `{"ok":...,"data":...,"error":...}` JSON；诊断写 stderr。
+退出码为 0（成功或正常 wait timeout）、1（业务或传输错误，含 send unknown）、2（参数错误）、
+130（用户取消）。发送返回 `delivery_uncertain` 或中途取消时结果可能未知，应复用同一 `send_key`
+查询既有结果；不得自动换 key 重发。若响应在途中丢失，客户端可能没有 `delivery_id`。
+
+Mac CLI、隔离 MCP 服务与专用真实 Discord 测试频道的两轮读写验收已通过；
+正数 wait 的截止时间、取消和错误路径由回归测试覆盖。生产服务器部署与 Windows CLI 尚未验收。
+桌面会话自动唤醒及频道到桌面的自动往返不属于本期 CLI 实现。
+
+---
+
 ## 架构
 
 ```
