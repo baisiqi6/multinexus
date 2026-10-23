@@ -23,6 +23,7 @@ _TOOL_FIELDS = {
     "coordinate.channel_wait": _COMMON_FIELDS | {"after_cursor", "limit", "timeout_seconds"},
 }
 _ERROR_CODES = frozenset({
+    "sender_unbound", "sender_unavailable", "sender_identity_mismatch",
     "invalid_input", "forbidden", "unsupported_platform", "unsupported_channel_type",
     "cursor_scope_mismatch", "invalid_cursor", "idempotency_conflict", "busy",
     "rate_limited", "upstream_unavailable", "content_unavailable", "delivery_rejected",

@@ -48,7 +48,9 @@ def assert_channel_message_is_inert(body: dict) -> None:
     client = DiscordClient.__new__(DiscordClient)
     client.agent_config = config
     client._agentd_mode = True
-    user = SimpleNamespace(id=111)
+    client._expected_bot_id = 111
+    client._identity_verified = True
+    user = SimpleNamespace(id=111, bot=True)
     client._connection = SimpleNamespace(user=user)
     client.mention_router = router
     client._resolve_or_notify = AsyncMock()

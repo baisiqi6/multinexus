@@ -39,6 +39,7 @@ class AgentEntry:
     agent_type: str
     executor_definition_id: str | None = None
     runner_profile_id: str | None = None
+    enabled: bool = True
 
     def to_canonical_dict(self) -> dict[str, str]:
         return {
@@ -384,6 +385,7 @@ def load_authority(path: str | Path) -> Authority:
 
             if executor_definition_id is None and runner_profile_id is None:
                 entries.append(AgentEntry(
+                    enabled=enabled,
                     id=agent_id,
                     display_name=display_name,
                     discord_user_id=discord_user_id,
@@ -422,6 +424,7 @@ def load_authority(path: str | Path) -> Authority:
                 agent_type=agent_type,
                 executor_definition_id=executor_definition_id,
                 runner_profile_id=runner_profile_id,
+                enabled=enabled,
             ))
             bindings.append(ExecutorInstanceBinding(
                 agent_id=agent_id,

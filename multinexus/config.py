@@ -57,6 +57,21 @@ def _load_dotenv_preserving_coordinate_env() -> None:
                 os.environ.pop(key, None)
 
 
+_CANONICAL_REGISTRY_PATH = Path(__file__).resolve().parents[1] / "config/agent-registry.toml"
+
+
+def canonical_discord_user_id(agent_id: str) -> int | None:
+    """Resolve the enabled managed identity through the existing authority parser."""
+    from .registry_authority import AuthorityError, load_authority
+    try:
+        authority = load_authority(_CANONICAL_REGISTRY_PATH)
+    except (AuthorityError, OSError, ValueError):
+        return None
+    entries = [entry for entry in authority.entries
+               if entry.id == agent_id and entry.agent_type == "managed" and entry.enabled]
+    return int(entries[0].discord_user_id) if len(entries) == 1 else None
+
+
 def _as_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -213,11 +228,12 @@ def _load_toml_agent(
 
     merged = {**defaults, **selected}
 
-    token = merged.get("token")
+    native = merged.get("adapter") == "desktop-native"
+    token = "" if native else merged.get("token")
     token_env = merged.get("token_env")
-    if not token and token_env:
+    if not native and not token and token_env:
         token = os.getenv(str(token_env))
-    if require_token and not token:
+    if not native and require_token and not token:
         raise SystemExit(
             f"Discord token missing for agent {agent_id!r}. Set {token_env} or token."
         )
@@ -225,7 +241,14 @@ def _load_toml_agent(
     return AgentConfig(
         id=str(merged.get("id") or agent_id),
         token=str(token),
+        expected_discord_user_id=None if native else canonical_discord_user_id(agent_id),
         adapter=str(merged.get("adapter", "openclaw")),
+        desktop_profile_file=merged.get("desktop_profile_file", ""),
+        desktop_recipient=merged.get("desktop_recipient", ""),
+        desktop_runtime_dir=merged.get("desktop_runtime_dir", "/private/tmp"),
+        desktop_codex_bin=merged.get("desktop_codex_bin", "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"),
+        desktop_host_socket=merged.get("desktop_host_socket", ""),
+        desktop_host_token_file=merged.get("desktop_host_token_file", ""),
         display_name=str(merged.get("display_name", "")),
         aliases=set(_as_list(merged.get("aliases"))),
         role_ids=set(_as_list(merged.get("role_ids"))),
@@ -406,7 +429,18 @@ def _load_toml_agent(
 def load_config(
     argv: list[str] | None = None, *, require_token: bool = True
 ) -> AgentConfig:
-    _load_dotenv_preserving_coordinate_env()
+    # Explicit native selection must precede shared dotenv/token loading.
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--config")
+    probe.add_argument("--agent")
+    selected, _ = probe.parse_known_args(argv)
+    native = False
+    if selected.config and selected.agent and Path(selected.config).is_file():
+        raw = tomllib.loads(Path(selected.config).read_text(encoding="utf-8"))
+        matches = [a for a in raw.get("agents", []) if a.get("id") == selected.agent]
+        native = len(matches) == 1 and {**raw.get("defaults", {}), **matches[0]}.get("adapter") == "desktop-native"
+    if not native:
+        _load_dotenv_preserving_coordinate_env()
 
     parser = argparse.ArgumentParser(
         description="MultiNexus single-agent bot runner"

@@ -31,7 +31,7 @@ from .agentd.coordinate_client import (
     CoordinateRuntimeError,
     make_coordinate_runtime_client,
 )
-from .config import load_config
+from .config import load_config, canonical_discord_user_id
 from .coordinator_handoff import CoordinatorHandoffMixin
 from .context.prompt import build_agent_prompt, build_agent_prompt_with_context
 from .context.store import ChatContextStore
@@ -108,6 +108,10 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         proxy_url = _resolve_bridge_proxy_url()
         super().__init__(intents=intents, proxy=proxy_url)
         self.agent_config = config
+        canonical_id = canonical_discord_user_id(config.id)
+        self._expected_bot_id = canonical_id if config.expected_discord_user_id in (None, canonical_id) else None
+        self._identity_verified = False
+        self._commands_registered = False
         self.context_store = ChatContextStore(config.context_db_path)
         self.mention_router = MentionRouter(config)
         self._bot_user_id_map: dict[str, int] = {}
@@ -129,10 +133,27 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
             self.adapter = make_adapter(config)
             self.session_store = SessionStore(config.context_db_path)
 
+    def _identity_ready(self) -> bool:
+        return bool(self._identity_verified and self._expected_bot_id is not None
+                    and self.user is not None and self.user.id == self._expected_bot_id
+                    and self.user.bot is True)
+
+    def is_ready(self) -> bool:
+        return self._identity_ready() and super().is_ready()
+
     async def setup_hook(self):
-        self._register_slash_commands()
+        # Registration and publication wait for the actual authenticated account.
+        pass
 
     async def on_ready(self):
+        self._identity_verified = bool(self._expected_bot_id is not None and self.user is not None
+                                       and self.user.id == self._expected_bot_id and self.user.bot is True)
+        if not self._identity_ready():
+            log.error("Discord sender identity unavailable or mismatched; client remains gated.")
+            return
+        if not self._commands_registered:
+            self._register_slash_commands()
+            self._commands_registered = True
         log.info(
             "DiscordClient ready: agent=%s bot=%s#%s agentd_mode=%s",
             self.agent_config.id,
@@ -171,11 +192,15 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
                     log.warning("Slash command sync failed", exc_info=True)
 
     def register_peer_bot(self, agent_id: str, user_id: int) -> None:
-        """Called when another agent's bot comes online to build the mention map."""
+        """Called when another verified bot comes online to build the mention map."""
+        if not self._identity_ready():
+            return
         self._bot_user_id_map[agent_id] = user_id
         self.mention_router.update_discord_user_ids(self._bot_user_id_map)
 
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        if not self._identity_ready():
+            return
         # Only react to edits from OTHER bots that now contain a handoff to us
         if not after.author.bot:
             return
@@ -217,6 +242,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         await self._handle_request(after, resolved_workspace=resolved_workspace)
 
     async def on_message(self, message: discord.Message):
+        if not self._identity_ready():
+            return
         # Layer 0: never respond to own messages
         if message.author.id == self.user.id:
             return
@@ -537,6 +564,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         @self.tree.command(name="agents", description="列出所有已知 agent")
         async def slash_agents(interaction: discord.Interaction):
+            if not self._identity_ready():
+                return
             if not await self._is_runtime_channel_allowed(interaction.channel):
                 await interaction.response.send_message("此频道不可用。", ephemeral=True)
                 return
@@ -552,6 +581,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         @self.tree.command(name="health", description="检查 adapter 健康状态")
         async def slash_health(interaction: discord.Interaction):
+            if not self._identity_ready():
+                return
             if not await self._is_runtime_channel_allowed(interaction.channel):
                 await interaction.response.send_message("此频道不可用。", ephemeral=True)
                 return
@@ -582,6 +613,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         @session_group.command(name="status", description="显示会话状态")
         async def slash_session_status(interaction: discord.Interaction):
+            if not self._identity_ready():
+                return
             if not await self._is_runtime_channel_allowed(interaction.channel):
                 await interaction.response.send_message("此频道不可用。", ephemeral=True)
                 return
@@ -601,6 +634,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
         @session_group.command(name="reset", description="重置当前会话")
         async def slash_session_reset(interaction: discord.Interaction):
+            if not self._identity_ready():
+                return
             if not await self._is_runtime_channel_allowed(interaction.channel):
                 await interaction.response.send_message("此频道不可用。", ephemeral=True)
                 return
@@ -759,6 +794,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
     async def _handle_request(self, message: discord.Message, *, resolved_workspace: str | None = None):
         """Process an addressed message: call adapter or submit via coordinate."""
+        if not self._identity_ready():
+            return
         channel = message.channel
         # Session scope: regular messages use channel/thread scope.
         session_scope_id = self._session_scope_for_message(message, resolved_workspace=resolved_workspace)
@@ -1009,6 +1046,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
     async def _recover_runtime_replies(self) -> None:
         """Replay bridge-owned terminal replies left by a prior process."""
+        if not self._identity_ready():
+            return
         if not self._coordinate_client:
             return
         pending = self.context_store.pending_runtime_replies(platform="discord")
@@ -1049,6 +1088,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
 
     def _start_reply_recovery(self) -> None:
         """Schedule one bridge-owned reply replay task at a time."""
+        if not self._identity_ready():
+            return
         if not self._agentd_mode:
             return
         if self._reply_recovery_task is None or self._reply_recovery_task.done():
@@ -1147,6 +1188,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         ``is_error`` comes from the AdapterResult machine outcome; context
         persistence must never reclassify the user-visible text.
         """
+        if not self._identity_ready():
+            return
         response_text = self.mention_router.resolve_handoff_mentions(response_text)
         handoff_lines, display_text = split_handoff_lines(response_text)
 
@@ -1197,8 +1240,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
                 ttl_seconds=self.agent_config.context_ttl_seconds,
             )
 
-    @staticmethod
     async def _send_text_chunks(
+        self,
         channel,
         placeholder: discord.Message | None,
         display_text: str,
@@ -1206,6 +1249,8 @@ class DiscordClient(CoordinatorHandoffMixin, discord.Client):
         report_lines: list[str],
     ) -> bool:
         """Send display text, handoff lines, and report lines to Discord."""
+        if not self._identity_ready():
+            return False
         delivered = False
         chunks = _chunk_message(display_text) if display_text else []
         if not chunks and not handoff_lines and not report_lines:
@@ -1337,15 +1382,18 @@ class DiscordBridge:
         Propagates the freshly-observed user_id to every other client so the
         shared mention map converges.
         """
+        if not client._identity_ready():
+            return
         user = client.user
         user_id = getattr(user, "id", None)
         if user_id is None:
             return
         for peer in self.clients:
-            if peer is client:
+            if peer is client or not peer._identity_ready():
                 continue
             try:
                 peer.register_peer_bot(client.agent_config.id, user_id)
+                client.register_peer_bot(peer.agent_config.id, peer.user.id)
             except Exception:
                 log.warning(
                     "register_peer_bot failed: %s -> %s",
@@ -1359,7 +1407,7 @@ class DiscordBridge:
     def is_all_ready(self) -> bool:
         """True if all clients have a bot user_id populated."""
         return all(
-            c.user is not None and c.user.id for c in self.clients
+            c._identity_ready() for c in self.clients
         )
 
     async def start(self) -> None:

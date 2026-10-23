@@ -4,6 +4,13 @@ multinexus 的所有重要变更都记录在这里。
 
 ---
 
+## [0.4.0] — 2026-10-22
+
+- 新增显式 `desktop.cli send/status/reply`、绑定既有 Codex/DSH 会话的 desktop-native worker 与默认关闭的 DSH Host；复用 Coordinate job/lease/progress，unknown 或已尝试请求不自动重发/入队。
+- Agent Instance Binding v2 仅持有 own channel 与独立薄 lifecycle capability；固定入口拒绝 profile/client 覆盖，ACK 与反向唤醒使用 receiver 自己的身份。Bot self-ID/readiness 与 verified author 关联失败时保持关闭。
+- 原生通信需 Coordinate v0.6.0；所有 Discord bridge 升级前配置本地 canonical registry 与真实 Bot IDs。旧 v1 profile/job/ACK 不能新发送或入队，旧共享身份 candidate 不可采用；无新 DB/schema、queue 或 scheduler。
+- 本轮发布包含离线契约/原生入口测试；真实 Discord author-ID、原业务双会话两轮自动往返、DSH native、busy/reload/cold 与 Windows 仍未验收，参见 [桌面会话文档](docs/desktop-sessions.md)。
+
 ## [0.3.0] — 2026-10-21
 
 - 新增 `python -m multinexus.channel_cli read|send|wait`，调用 Coordinate v0.5.0 的频道工具；MCP SDK 是可选依赖，不影响原 bridge/agentd 安装。

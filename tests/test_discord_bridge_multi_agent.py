@@ -134,7 +134,7 @@ class DiscordBridgeMentionPropagationTests(unittest.TestCase):
 
         self._patchers = []
         for c, uid in zip(bridge.clients, (1001, 1002)):
-            fake = type("FakeUser", (), {"id": uid, "name": f"bot-{uid}", "discriminator": "0001"})()
+            fake = type("FakeUser", (), {"id": uid, "bot": True, "name": f"bot-{uid}", "discriminator": "0001"})()
             # Patch the *instance* via a per-instance subclass that overrides
             # ``user``. This is more reliable than class-level patching when
             # we have multiple clients that all need different fakes.
@@ -144,6 +144,9 @@ class DiscordBridgeMentionPropagationTests(unittest.TestCase):
             patcher = patch.object(c, "__class__", sub)
             patcher.start()
             self._patchers.append(patcher)
+            # Identity is already verified in this isolated map-propagation fixture.
+            c._expected_bot_id = uid
+            c._identity_verified = True
 
         return bridge
 
