@@ -1,0 +1,13 @@
+{
+  "name": "@multinexus/dsh-desktop-host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Allowlisted existing DSH desktop session Host transport",
+  "type": "module",
+  "main": "./index.js",
+  "exports": { ".": "./index.js", "./package.json": "./package.json", "./cordis.patch.yml": "./cordis.patch.yml" },
+  "files": ["index.js", "host.js", "cordis.patch.yml", "README.md"],
+  "engines": { "node": ">=22", "dsh": "=0.2.1-rc.2" },
+  "peerDependencies": { "@deepseek-ai/dsh-api-session-controller": "0.2.1-rc.2" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

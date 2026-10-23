@@ -1,0 +1,5 @@
+- insert:
+    - id: multinexus-dsh-desktop-host
+      name: '@multinexus/dsh-desktop-host'
+      config:
+        enabled: false

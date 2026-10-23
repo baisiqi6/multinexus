@@ -87,7 +87,40 @@ endpoint 要求 HTTPS；仅本机 loopback HTTP 供隔离测试使用，禁止 U
 
 Mac CLI、隔离 MCP 服务与专用真实 Discord 测试频道的两轮读写验收已通过；
 正数 wait 的截止时间、取消和错误路径由回归测试覆盖。生产服务器部署与 Windows CLI 尚未验收。
-桌面会话自动唤醒及频道到桌面的自动往返不属于本期 CLI 实现。
+普通频道 CLI 的 `read/send/wait` 仍不自动唤醒桌面会话。
+
+### 原生桌面会话通信（显式启用，Mac）
+
+本入口需要 Coordinate v0.6.0 的 Agent identity/lifecycle 契约。升级至 v0.4.0 后，所有 Discord bridge
+启动也需要本地 `config/agent-registry.toml`：先复制 `config/agent-registry.example.toml`，
+将 Agent IDs 与本地 `agents.toml` 对齐，并填入每个 Bot 的实际 Discord user ID。示例 ID 是合成值；
+现有 setup 向导只生成 `.env` 与 `agents.toml`，仍须完成此 registry 配置。缺失、disabled 或 self-ID
+不匹配会阻止 readiness/路由；不要用共享 Bot 或虚构 ID 绕过身份门禁。
+
+另有 `python -m multinexus.desktop.cli send/status/reply` 与专用
+`adapter = "desktop-native"` worker，可向精确绑定的既有 Codex/DSH 会话提交通信。
+它复用 Coordinate job/lease/progress 和原生 inbox；不创建新 Agent、会话、轮询器或状态数据库，
+不覆盖原会话 cwd、模型、权限或业务暂停。`done` 只表示接收方通过可信渠道回执完成
+`receiver_acknowledged`，不表示原生模型 turn 已完成。未收到 ACK 保持
+`timed_out` / `native_delivery_uncertain`，显式恢复只观察原请求，绝不重新入队。
+
+DSH Host 源码默认 `config.enabled: false`。官方 Plugin Manager 的 bundle On 不会改变
+该配置，当前也没有配置 UI；采用时须先从已审源码制作私有稳定副本，仅将 manifest 改为
+`config.enabled: true`，核对 source/代码字节、完整 diff 和 hashes，再通过官方 Add plugin / On
+启用。若存在旧 one-shot probe，先通过官方 Off 并确认其 runtime 已停止。
+这些动作属于单独的采用门禁，源码与临时数据库测试通过不构成安装或原生验收。
+
+新原生入口采用 **Agent Instance Binding**：每个 v2 profile 固定 local_alias，只引用自己的
+channel capability 与独立薄 submit/get lifecycle capability；peer 只保留非秘密 session/identity
+元数据。私有 launcher 调用 `bound_main(own_profile)`，仅 `--to` 可选接收方，拒绝
+`--client`/`--profile` 覆盖；ACK 和 `--wake-source` 都使用 receiver 自己的 principal。
+服务端由 canonical registry 与 `channel_agent_id` 绑定 Bot，核验 self-ID 和 POST author 后
+才返回 verified receipt。身份 snapshot 是关联证据；真实平台验收仍要 receiver 自己读取 author。
+旧 v1 profile/job/ACK 不可新发送或入队；固定入口/0600 不构成同 UID 的 OS 隔离。新增 Agent
+复用相同 canonical 模式；adapter 管传输、agentd 管 lease/progress，model 与 session 均不等于身份。
+
+精确 profile/凭据/worker 配置、独立 cwd 下的 reply 命令、`--wake-source`、部分反向失败及
+loaded/idle、cold、Windows 和权限观测边界见 [原生桌面会话通信](docs/desktop-sessions.md)。
 
 ---
 

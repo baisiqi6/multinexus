@@ -101,6 +101,14 @@ class AgentConfig:
     coordinate_http_client_id: str = ""
     coordinate_http_token_file: str = ""
 
+    # Dedicated original-desktop-session worker (never provider CLI overrides).
+    desktop_profile_file: str = ""
+    desktop_recipient: str = ""
+    desktop_runtime_dir: str = "/private/tmp"
+    desktop_codex_bin: str = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+    desktop_host_socket: str = ""
+    desktop_host_token_file: str = ""
+
     # Agentd (local daemon mode)
     agentd_mode: bool = False
     agentd_port: int = 0  # 0 = auto-assign
@@ -110,3 +118,6 @@ class AgentConfig:
     kook_poll_channel_ids: list[int] = field(default_factory=list)
     kook_poll_interval_seconds: int = 5
     kook_poll_page_size: int = 50
+
+    # Canonical expected platform identity, never a sender-selection override.
+    expected_discord_user_id: int | None = None

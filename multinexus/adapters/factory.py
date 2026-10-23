@@ -13,6 +13,9 @@ from .zcode import ZCodeAdapter
 
 def make_adapter(config: AgentConfig) -> AgentAdapter:
     adapter = config.adapter.lower()
+    if adapter == "desktop-native":
+        from ..desktop.native import DesktopNativeAdapter
+        return DesktopNativeAdapter(config)
     if adapter == "acp":
         return ACPAdapter(config)
     if adapter == "claude":

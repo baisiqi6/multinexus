@@ -273,3 +273,9 @@ def test_real_sdk_and_cli_match_all_three_tools_on_loopback(monkeypatch, capsys)
             runner.should_exit = True
             thread.join(timeout=5)
             assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("code", ["sender_unbound", "sender_unavailable", "sender_identity_mismatch"])
+def test_sender_identity_errors_are_valid_static_envelopes(transport, code):
+    envelope = {"ok": False, "data": None, "error": {"code": code, "message": "Sender unavailable."}}
+    assert transport._translate_result(SimpleNamespace(structured_content=envelope), "fixture-secret") == envelope

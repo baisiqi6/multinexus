@@ -77,7 +77,7 @@ class AgentdWorker:
     def __init__(self, config: AgentConfig):
         self.config = config
         self.adapter = make_adapter(config)
-        self.session_store = SessionStore(config.context_db_path)
+        self.session_store = None if config.adapter.lower() == "desktop-native" else SessionStore(config.context_db_path)
         # Single transport factory: cli (default) or http, never both.
         self.coordinate = make_coordinate_runtime_client(config)
         self.health = AgentdHealthProjection.from_environment(config.id)
@@ -418,6 +418,26 @@ class AgentdWorker:
         else:
             log.warning("Job claim blocked: reason=%s %s", reason, extra)
 
+    def _claim_error(self, exc):
+        return "Native claim validation failed." if self.config.adapter.lower() == "desktop-native" else str(exc)
+
+    async def _report_claim_job(self, *, native_job=None, native_lease=None, **kwargs):
+        if self.config.adapter.lower() == "desktop-native":
+            # Prior attempts stay uncertain even when claim validation prevents
+            # observation. Only independently validated original data is retained.
+            from .desktop_execution import native_validation_result
+            try:
+                payload = self._extract_payload(native_job)
+            except ValueError:
+                payload = None
+            result = native_validation_result(self.adapter, native_job, payload, native_lease)
+            kwargs["status"] = result.outcome
+            kwargs["result_json"] = {"response_text": result.text, "text": result.text,
+                                     "summary": result.text, "outcome": result.outcome,
+                                     "session_id": result.session_id, "error_category": result.error_category,
+                                     **result.metadata}
+        return await self.coordinate.report_job(**kwargs)
+
     async def _process_job(self, claim_result: dict[str, Any]) -> None:
         raw_job = claim_result.get("job") or {}
         raw_attempt_token = claim_result.get("attempt_token")
@@ -447,7 +467,7 @@ class AgentdWorker:
                 )
             except ExecutionLeaseError as exc:
                 log.error(
-                    "Invalid execution lease for agent %s: %s", self.config.id, exc
+                    "Invalid execution lease for agent %s: %s", self.config.id, self._claim_error(exc)
                 )
                 # Never use unverified job_id/attempt_token to mutate Coordinate.
                 return
@@ -463,6 +483,9 @@ class AgentdWorker:
             trusted_attempt_token = raw_attempt_int
             trusted_lease_id = None
 
+        if self.config.adapter.lower() == "desktop-native" and lease is None:
+            return
+
         # Extract payload. With a valid lease we can report parse failures using
         # trusted lease authority; without one we cannot prove anything.
         try:
@@ -470,7 +493,8 @@ class AgentdWorker:
         except ValueError as exc:
             log.error("Invalid payload for job %s", trusted_job_id)
             if lease is not None:
-                await self.coordinate.report_job(
+                await self._report_claim_job(
+                    native_job=raw_job, native_lease=lease,
                     job_id=trusted_job_id,
                     agent_id=self.config.id,
                     status="failed",
@@ -495,7 +519,8 @@ class AgentdWorker:
                     self.config.id,
                     trusted_job_id,
                 )
-                await self.coordinate.report_job(
+                await self._report_claim_job(
+                    native_job=raw_job, native_lease=lease,
                     job_id=trusted_job_id,
                     agent_id=self.config.id,
                     status="failed",
@@ -513,9 +538,10 @@ class AgentdWorker:
                 )
             except ExecutorBindingError as exc:
                 log.error(
-                    "Executor binding mismatch for agent %s: %s", self.config.id, exc
+                    "Executor binding mismatch for agent %s: %s", self.config.id, self._claim_error(exc)
                 )
-                await self.coordinate.report_job(
+                await self._report_claim_job(
+                    native_job=raw_job, native_lease=lease,
                     job_id=trusted_job_id,
                     agent_id=self.config.id,
                     status="failed",
@@ -531,7 +557,8 @@ class AgentdWorker:
                     self.config.id,
                     trusted_job_id,
                 )
-                await self.coordinate.report_job(
+                await self._report_claim_job(
+                    native_job=raw_job, native_lease=lease,
                     job_id=trusted_job_id,
                     agent_id=self.config.id,
                     status="failed",
@@ -559,10 +586,11 @@ class AgentdWorker:
                 agent_id=self.config.id,
             )
         except ExecutionContextError as exc:
-            log.error("Invalid execution context for agent %s: %s", self.config.id, exc)
+            log.error("Invalid execution context for agent %s: %s", self.config.id, self._claim_error(exc))
             # Use trusted lease authority when available; otherwise raw attempt token.
             if isinstance(trusted_attempt_token, int):
-                await self.coordinate.report_job(
+                await self._report_claim_job(
+                    native_job=raw_job, native_lease=lease,
                     job_id=trusted_job_id,
                     agent_id=self.config.id,
                     status="failed",
@@ -585,9 +613,10 @@ class AgentdWorker:
                 trusted_lease_id = lease.lease_id
             except ExecutionLeaseError as exc:
                 log.error(
-                    "Lease cross-check failed for agent %s: %s", self.config.id, exc
+                    "Lease cross-check failed for agent %s: %s", self.config.id, self._claim_error(exc)
                 )
-                await self.coordinate.report_job(
+                await self._report_claim_job(
+                    native_job=raw_job, native_lease=lease,
                     job_id=trusted_job_id,
                     agent_id=self.config.id,
                     status="failed",
@@ -613,9 +642,10 @@ class AgentdWorker:
                 log.error(
                     "Lease binding cross-check failed for agent %s: %s",
                     self.config.id,
-                    exc,
+                    self._claim_error(exc),
                 )
-                await self.coordinate.report_job(
+                await self._report_claim_job(
+                    native_job=raw_job, native_lease=lease,
                     job_id=trusted_job_id,
                     agent_id=self.config.id,
                     status="failed",
@@ -626,6 +656,12 @@ class AgentdWorker:
                     lease_id=trusted_lease_id,
                 )
                 return
+
+        if self.config.adapter.lower() == "desktop-native":
+            if lease is not None and binding is not None:
+                from .desktop_execution import process_native_job
+                await process_native_job(self, job, payload, ctx, binding, lease, raw_lease)
+            return
 
         prompt = payload.get("prompt", "")
         log.info(

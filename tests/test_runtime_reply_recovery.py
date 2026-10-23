@@ -29,6 +29,9 @@ class RuntimeReplyRecoveryTests(unittest.TestCase):
             destination_id="123",
         )
         client = DiscordClient.__new__(DiscordClient)
+        client._identity_verified = True
+        client._expected_bot_id = 111
+        client._connection = SimpleNamespace(user=SimpleNamespace(id=111, bot=True))
         client.context_store = store
         client.agent_config = SimpleNamespace(id="mac-claude", timeout=1)
         client._coordinate_client = SimpleNamespace(

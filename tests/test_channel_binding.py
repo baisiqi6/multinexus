@@ -330,6 +330,9 @@ class TestDiscordOnMessageChannelBinding(unittest.TestCase):
         instance._coordinate_client = None
         mock_user = MagicMock()
         mock_user.id = 111
+        mock_user.bot = True
+        instance._expected_bot_id = 111
+        instance._identity_verified = True
         instance._connection = MagicMock()
         instance._connection.user = mock_user
         instance.context_store = MagicMock()
@@ -884,6 +887,9 @@ class TestHandoffWorkspaceMismatch(unittest.TestCase):
         instance._agentd_mode = True
         mock_user = MagicMock()
         mock_user.id = 111
+        mock_user.bot = True
+        instance._expected_bot_id = 111
+        instance._identity_verified = True
         instance._connection = MagicMock()
         instance._connection.user = mock_user
         instance.context_store = MagicMock()

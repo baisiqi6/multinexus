@@ -86,6 +86,9 @@ def _make_runtime_client(config=None):
     # discord.Client.user reads from _connection.user
     mock_user = MagicMock()
     mock_user.id = 111
+    mock_user.bot = True
+    instance._expected_bot_id = 111
+    instance._identity_verified = True
     instance._connection = MagicMock()
     instance._connection.user = mock_user
     instance._bot_user_id_map = {}
